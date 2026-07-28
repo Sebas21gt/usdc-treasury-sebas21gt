@@ -5,9 +5,13 @@
     "build": "turbo build",
     "dev": "turbo dev",
     "lint": "turbo lint",
-    "type-check": "turbo type-check"
+    "type-check": "turbo type-check",
+    "spike:evm-solana": "ts-node --project scripts/tsconfig.json scripts/spike-evm-solana.ts"
   },
   "devDependencies": {
+    "@types/bs58": "^4.0.4",
+    "dotenv": "^16.4.5",
+    "ts-node": "^10.9.2",
     "turbo": "^2.5.4",
     "typescript": "^5.8.3"
   },
