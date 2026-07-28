@@ -7,7 +7,7 @@ import { createWalletClient, http, publicActions } from "viem";
 import { privateKeyToAccount } from "viem/accounts";
 import { polygonAmoy } from "viem/chains";
 import { CCTP_CONTRACTS } from "../../../../packages/engine/src/config";
-import { buildStellarMintXdr, buildStellarBurnXdr, buildCctpForwarderHookData, contractStrkeyToBytes32, buildFullStellarMintTx } from "../../../../packages/engine/src/chains/stellar";
+import { buildStellarMintXdr, buildStellarBurnXdr, buildCctpForwarderHookData, contractStrkeyToBytes32, buildFullStellarMintTx, buildFullStellarBurnTx, buildFullStellarApproveTx } from "../../../../packages/engine/src/chains/stellar";
 
 // EVM ABI just for depositForBurnWithHook
 const TOKEN_MESSENGER_ABI = [
@@ -47,7 +47,10 @@ export default function Home() {
   const [logs, setLogs] = useState<string[]>([]);
   const [isBurning, setIsBurning] = useState(false);
   const [isMinting, setIsMinting] = useState(false);
+  const [isBurningStellar, setIsBurningStellar] = useState(false);
+  const [isMintingPolygon, setIsMintingPolygon] = useState(false);
   const [mintMessage, setMintMessage] = useState<{ message: string; attestation: string } | null>(null);
+  const [polygonMintMessage, setPolygonMintMessage] = useState<{ message: string; attestation: string } | null>(null);
 
   const log = (msg: string) => setLogs((prev) => [...prev, msg]);
 
@@ -163,6 +166,97 @@ export default function Home() {
     }
   };
 
+  // Spike 3: Stellar -> Polygon
+  const handleStellarToPolygon = async () => {
+    setIsBurningStellar(true);
+    setLogs([]);
+    try {
+      if (!pollar.wallet?.address) throw new Error("Pollar wallet not connected");
+      log(`Initiating Burn on Stellar from: ${pollar.wallet.address}`);
+
+      log("Building Stellar Burn Tx locally...");
+      
+      const amountSubunits = BigInt(10000000); // 1 USDC in Stellar stroops (7 decimals)
+      const recipientAddress = "0x0279A7D9f93805A9D0bF7bb7a88A99D7392934AC"; // Backend wallet address (cannot mint to USDC contract itself)
+      // Pad EVM address to 32 bytes
+      const mintRecipientBytes32 = recipientAddress.replace("0x", "").padStart(64, "0");
+
+      log("Building Stellar Approve Tx locally...");
+      const approveXdr = await buildFullStellarApproveTx({
+        amountSubunits,
+        burnTokenStrkey: CCTP_CONTRACTS.stellar.usdc,
+        sourceAccountPubkey: pollar.wallet.address
+      });
+
+      log("Submitting Approve to Pollar...");
+      const approveResult = await pollar.signAndSubmitTx(approveXdr);
+      if (approveResult.status === "error") {
+        throw new Error(approveResult.message || approveResult.details || "Approve failed");
+      }
+      log(`Stellar Approve success! Hash: ${approveResult.hash}`);
+      
+      // Wait a few seconds for the network to index the approve
+      await new Promise(r => setTimeout(r, 2000));
+
+      log("Building Stellar Burn Tx locally...");
+      const unsignedXdr = await buildFullStellarBurnTx({
+        amountSubunits,
+        destinationDomain: CCTP_CONTRACTS.polygon.domain,
+        mintRecipientBytes32,
+        burnTokenStrkey: CCTP_CONTRACTS.stellar.usdc,
+        sourceAccountPubkey: pollar.wallet.address
+      });
+
+      log("Submitting Burn to Pollar...");
+      const result = await pollar.signAndSubmitTx(unsignedXdr);
+      if (result.status === "error") {
+        throw new Error(result.message || result.details || "Burn failed");
+      }
+      log(`Stellar Burn success! Hash: ${result.hash}`);
+
+      // 2. Fetch attestation
+      log("Waiting for Circle attestation...");
+      const attestation = await waitForAttestation(CCTP_CONTRACTS.stellar.domain, result.hash);
+      log("Attestation received!");
+      setPolygonMintMessage(attestation);
+
+    } catch (e: any) {
+      log(`Error: ${e.message}`);
+      console.error(e);
+    } finally {
+      setIsBurningStellar(false);
+    }
+  };
+
+  const handleMintOnPolygon = async () => {
+    if (!polygonMintMessage) return;
+    setIsMintingPolygon(true);
+    try {
+      log("Submitting mint payload to backend API...");
+      
+      const response = await fetch('/api/mint', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          messageHex: polygonMintMessage.message,
+          attestationHex: polygonMintMessage.attestation
+        })
+      });
+
+      const data = await response.json();
+      if (!response.ok || data.error) {
+        throw new Error(data.error || "Backend error");
+      }
+
+      log(`Polygon Mint success! Hash: ${data.hash}`);
+    } catch (e: any) {
+      log(`Error: ${e.message}`);
+      console.error(e);
+    } finally {
+      setIsMintingPolygon(false);
+    }
+  };
+
   return (
     <main className="p-8 font-mono">
       <h1 className="text-2xl font-bold mb-4">Spike 2: Pollar Treasury (Polygon ↔ Stellar)</h1>
@@ -192,6 +286,24 @@ export default function Home() {
           className="px-4 py-2 bg-green-600 text-white rounded hover:bg-green-700 disabled:opacity-50"
         >
           {isMinting ? "Recibiendo..." : "2. Recibir USDC en Stellar"}
+        </button>
+      </div>
+
+      <div className="flex gap-4 mb-8 items-center border-t border-gray-700 pt-4 mt-4">
+        <button 
+          onClick={handleStellarToPolygon} 
+          disabled={isBurningStellar}
+          className="px-4 py-2 bg-orange-600 text-white rounded hover:bg-orange-700 disabled:opacity-50"
+        >
+          {isBurningStellar ? "Quemando..." : "3. Quemar 1 USDC en Stellar"}
+        </button>
+
+        <button 
+          onClick={handleMintOnPolygon} 
+          disabled={isMintingPolygon || !polygonMintMessage}
+          className="px-4 py-2 bg-purple-600 text-white rounded hover:bg-purple-700 disabled:opacity-50"
+        >
+          {isMintingPolygon ? "Recibiendo..." : "4. Recibir USDC en Polygon (API)"}
         </button>
       </div>
 

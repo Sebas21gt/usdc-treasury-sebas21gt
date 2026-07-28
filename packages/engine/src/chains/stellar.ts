@@ -60,9 +60,26 @@ export async function buildStellarBurnXdr(params: {
     nativeToScVal(0, { type: 'u32' }), // minFinalityThreshold = 0
   ];
 
-  // Dummy transaction builder just to get the operation XDR
-  // In Pollar, you can pass the operation to `buildTx({ operations: [op] })`
   return contract.call('deposit_for_burn', ...args);
+}
+
+export async function buildStellarApproveXdr(params: {
+  usdcContractStrkey: string;
+  sourceCallerStrkey: string;
+  spenderStrkey: string;
+  amountSubunits: bigint;
+  expirationLedger: number;
+}) {
+  const contract = new Contract(params.usdcContractStrkey);
+  
+  const args = [
+    Address.fromString(params.sourceCallerStrkey).toScVal(),
+    Address.fromString(params.spenderStrkey).toScVal(),
+    nativeToScVal(params.amountSubunits, { type: 'i128' }),
+    nativeToScVal(params.expirationLedger, { type: 'u32' }),
+  ];
+
+  return contract.call('approve', ...args);
 }
 
 // 2. Build XDR to mint USDC on Stellar (MessageTransmitter.receive_message)
@@ -100,7 +117,82 @@ export async function buildFullStellarMintTx(params: {
     .build();
 
   const rpcServer = new rpc.Server('https://soroban-testnet.stellar.org');
-  const preparedTx = await rpcServer.prepareTransaction(tx);
+  const preparedTx = await rpcServer.prepareTransaction(tx) as any;
+  if (preparedTx.error) {
+    throw new Error(`Failed to simulate Soroban Tx: ${JSON.stringify(preparedTx.error)}`);
+  }
+
+  return preparedTx.toXDR();
+}
+
+export async function buildFullStellarBurnTx(params: {
+  amountSubunits: bigint;
+  destinationDomain: number;
+  mintRecipientBytes32: string;
+  burnTokenStrkey: string;
+  sourceAccountPubkey: string;
+}) {
+  const op = await buildStellarBurnXdr({
+    amountSubunits: params.amountSubunits,
+    destinationDomain: params.destinationDomain,
+    mintRecipientBytes32: params.mintRecipientBytes32,
+    burnTokenStrkey: params.burnTokenStrkey,
+    sourceCallerStrkey: params.sourceAccountPubkey
+  });
+
+  const horizon = new Horizon.Server("https://horizon-testnet.stellar.org");
+  const rpcServer = new rpc.Server("https://soroban-testnet.stellar.org");
+  const sourceAccount = await horizon.loadAccount(params.sourceAccountPubkey);
+
+  const tx = new TransactionBuilder(sourceAccount, {
+    fee: "10000",
+    networkPassphrase: NETWORK_PASSPHRASE,
+  })
+    .addOperation(op)
+    .setTimeout(180)
+    .build();
+
+  const preparedTx = await rpcServer.prepareTransaction(tx) as any;
+  if (preparedTx.error) {
+    throw new Error(`Failed to simulate Soroban Burn Tx: ${JSON.stringify(preparedTx.error)}`);
+  }
+
+  return preparedTx.toXDR();
+}
+
+export async function buildFullStellarApproveTx(params: {
+  amountSubunits: bigint;
+  burnTokenStrkey: string;
+  sourceAccountPubkey: string;
+}) {
+  const horizon = new Horizon.Server("https://horizon-testnet.stellar.org");
+  const rpcServer = new rpc.Server("https://soroban-testnet.stellar.org");
+  
+  const latestLedger = await rpcServer.getLatestLedger();
+  const expirationLedger = latestLedger.sequence + 10000;
+
+  const approveOp = await buildStellarApproveXdr({
+    usdcContractStrkey: params.burnTokenStrkey,
+    sourceCallerStrkey: params.sourceAccountPubkey,
+    spenderStrkey: CCTP_CONTRACTS.stellar.tokenMessengerMinter,
+    amountSubunits: params.amountSubunits,
+    expirationLedger
+  });
+
+  const sourceAccount = await horizon.loadAccount(params.sourceAccountPubkey);
+
+  const tx = new TransactionBuilder(sourceAccount, {
+    fee: "10000",
+    networkPassphrase: NETWORK_PASSPHRASE,
+  })
+    .addOperation(approveOp)
+    .setTimeout(180)
+    .build();
+
+  const preparedTx = await rpcServer.prepareTransaction(tx) as any;
+  if (preparedTx.error) {
+    throw new Error(`Failed to simulate Soroban Approve Tx: ${JSON.stringify(preparedTx.error)}`);
+  }
 
   return preparedTx.toXDR();
 }
