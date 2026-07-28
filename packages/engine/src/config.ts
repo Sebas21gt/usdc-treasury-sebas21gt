@@ -21,3 +21,24 @@ export const CCTP_CONTRACTS = {
 } as const;
 
 export const IRIS_API_URL = process.env.CCTP_ATTESTATION_URL ?? 'https://iris-api-sandbox.circle.com';
+
+// Expressed in whole USDC tokens
+export const TREASURY_CONFIG = {
+  polygon: {
+    min: 10,
+    target: 50,
+    max: 100
+  },
+  solana: {
+    min: 10,
+    target: 50,
+    max: 100
+  },
+  stellar: {
+    min: 10,
+    target: 50,
+    max: 100
+  }
+} as const;
+
+export type SupportedChain = keyof typeof CCTP_CONTRACTS;

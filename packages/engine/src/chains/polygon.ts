@@ -1,95 +1,162 @@
-import {
-  createPublicClient,
-  createWalletClient,
-  http,
-  parseUnits,
-  formatUnits,
-  type Hex,
-} from 'viem';
+import { createPublicClient, createWalletClient, http, parseUnits } from 'viem';
 import { privateKeyToAccount } from 'viem/accounts';
 import { polygonAmoy } from 'viem/chains';
-import type { BurnResult, MintResult, CctpAttestation } from '@usdc-treasury/shared';
 import { CCTP_CONTRACTS } from '../config';
 
-function getClients(rpcUrl: string) {
-  const account = privateKeyToAccount((process.env.POLYGON_PRIVATE_KEY ?? '') as Hex);
-  const publicClient = createPublicClient({ chain: polygonAmoy, transport: http(rpcUrl) });
-  const walletClient = createWalletClient({ account, chain: polygonAmoy, transport: http(rpcUrl) });
-  return { account, publicClient, walletClient };
-}
-
-const TOKEN_MESSENGER_ABI = [{
-  name: 'depositForBurn', type: 'function', stateMutability: 'nonpayable',
-  inputs: [
-    { name: 'amount', type: 'uint256' }, { name: 'destinationDomain', type: 'uint32' },
-    { name: 'mintRecipient', type: 'bytes32' }, { name: 'burnToken', type: 'address' },
-    { name: 'destinationCaller', type: 'bytes32' }, { name: 'maxFee', type: 'uint256' },
-    { name: 'minFinalityThreshold', type: 'uint32' }
-  ],
-  outputs: []
-}] as const;
-
-const MESSAGE_TRANSMITTER_ABI = [{
-  name: 'receiveMessage', type: 'function', stateMutability: 'nonpayable',
-  inputs: [{ name: 'message', type: 'bytes' }, { name: 'attestation', type: 'bytes' }],
-  outputs: [{ name: 'success', type: 'bool' }]
-}] as const;
-
-const ERC20_ABI = [
-  { name: 'approve', type: 'function', stateMutability: 'nonpayable', inputs: [{ name: 'spender', type: 'address' }, { name: 'amount', type: 'uint256' }], outputs: [{ name: '', type: 'bool' }] },
-  { name: 'balanceOf', type: 'function', stateMutability: 'view', inputs: [{ name: 'account', type: 'address' }], outputs: [{ name: '', type: 'uint256' }] }
+const TOKEN_MESSENGER_ABI = [
+  {
+    type: "function",
+    name: "depositForBurnWithHook",
+    stateMutability: "nonpayable",
+    inputs: [
+      { name: "amount", type: "uint256" },
+      { name: "destinationDomain", type: "uint32" },
+      { name: "mintRecipient", type: "bytes32" },
+      { name: "burnToken", type: "address" },
+      { name: "destinationCaller", type: "bytes32" },
+      { name: "maxFee", type: "uint256" },
+      { name: "minFinalityThreshold", type: "uint32" },
+      { name: "hookData", type: "bytes" }
+    ],
+    outputs: [{ type: "uint64" }]
+  },
+  {
+    type: "function",
+    name: "depositForBurn",
+    stateMutability: "nonpayable",
+    inputs: [
+      { name: "amount", type: "uint256" },
+      { name: "destinationDomain", type: "uint32" },
+      { name: "mintRecipient", type: "bytes32" },
+      { name: "burnToken", type: "address" }
+    ],
+    outputs: [{ type: "uint64" }]
+  }
 ] as const;
 
-export async function getPolygonBalance(rpcUrl: string): Promise<number> {
-  const { account, publicClient } = getClients(rpcUrl);
-  const raw = await publicClient.readContract({
-    address: CCTP_CONTRACTS.polygon.usdc as Hex,
-    abi: ERC20_ABI,
-    functionName: 'balanceOf',
-    args: [account.address],
-  });
-  return Number(formatUnits(raw, 6));
-}
-
-export async function polygonBurn(params: {
-  rpcUrl: string;
-  destinationDomain: number;
-  amountUsdc: number;
-  mintRecipient: Hex;
-}): Promise<BurnResult> {
-  const { rpcUrl, destinationDomain, amountUsdc, mintRecipient } = params;
-  const { walletClient, publicClient } = getClients(rpcUrl);
-  const amount = parseUnits(String(amountUsdc), 6);
-
-  console.log(`Approving ${amountUsdc} USDC on Polygon...`);
-  const approveTxHash = await walletClient.writeContract({
-    address: CCTP_CONTRACTS.polygon.usdc as Hex,
-    abi: ERC20_ABI,
-    functionName: 'approve',
-    args: [CCTP_CONTRACTS.polygon.tokenMessenger as Hex, amount],
-  });
-  await publicClient.waitForTransactionReceipt({ hash: approveTxHash });
-
-  console.log(`Burning ${amountUsdc} USDC on Polygon...`);
-  const burnTxHash = await walletClient.writeContract({
-    address: CCTP_CONTRACTS.polygon.tokenMessenger as Hex,
-    abi: TOKEN_MESSENGER_ABI,
-    functionName: 'depositForBurn',
-    args: [
-      amount, destinationDomain, mintRecipient,
-      CCTP_CONTRACTS.polygon.usdc as Hex,
-      '0x0000000000000000000000000000000000000000000000000000000000000000' as Hex, // any caller
-      BigInt(0), 2000
+const ERC20_ABI = [
+  {
+    type: "function",
+    name: "approve",
+    stateMutability: "nonpayable",
+    inputs: [
+      { name: "spender", type: "address" },
+      { name: "amount", type: "uint256" }
     ],
+    outputs: [{ type: "bool" }]
+  }
+] as const;
+
+const MESSAGE_TRANSMITTER_ABI = [
+  {
+    type: "function",
+    name: "receiveMessage",
+    stateMutability: "nonpayable",
+    inputs: [
+      { name: "message", type: "bytes" },
+      { name: "signature", type: "bytes" }
+    ],
+    outputs: [{ type: "bool", name: "success" }]
+  }
+] as const;
+
+export function getPolygonClients(privateKeyHex: string, rpcUrl: string = "https://polygon-amoy.drpc.org") {
+  const account = privateKeyToAccount(privateKeyHex.startsWith('0x') ? privateKeyHex as `0x${string}` : `0x${privateKeyHex}`);
+  const publicClient = createPublicClient({
+    chain: polygonAmoy,
+    transport: http(rpcUrl)
   });
-
-  const receipt = await publicClient.waitForTransactionReceipt({ hash: burnTxHash });
-  const messageSentLog = receipt.logs.find(log => log.topics[0] === '0x8c5261668696ce22758910d05bab8f186d6eb247ceac2af2e82c7dc17669b036');
-  const messageHash = messageSentLog?.topics[1] ?? burnTxHash;
-
-  return { txHash: burnTxHash, messageHash, sourceDomain: 7 };
+  const walletClient = createWalletClient({
+    account,
+    chain: polygonAmoy,
+    transport: http(rpcUrl)
+  });
+  return { publicClient, walletClient, account };
 }
 
-export function polygonExplorerUrl(txHash: string): string {
-  return `https://amoy.polygonscan.com/tx/${txHash}`;
+export async function burnOnPolygon(params: {
+  amountSubunits: bigint;
+  destinationDomain: number;
+  mintRecipientBytes32: string;
+  destinationCallerBytes32?: string;
+  hookData?: string;
+  privateKeyHex: string;
+  rpcUrl?: string;
+}) {
+  const { publicClient, walletClient, account } = getPolygonClients(params.privateKeyHex, params.rpcUrl);
+
+  // 1. Approve TokenMessenger to spend USDC
+  const approveHash = await walletClient.writeContract({
+    address: CCTP_CONTRACTS.polygon.usdc as `0x${string}`,
+    abi: ERC20_ABI,
+    functionName: "approve",
+    args: [
+      CCTP_CONTRACTS.polygon.tokenMessenger as `0x${string}`,
+      params.amountSubunits
+    ],
+    account
+  });
+  
+  await publicClient.waitForTransactionReceipt({ hash: approveHash });
+
+  // 2. Deposit For Burn
+  let hash: `0x${string}`;
+  if (params.hookData && params.destinationCallerBytes32) {
+    hash = await walletClient.writeContract({
+      address: CCTP_CONTRACTS.polygon.tokenMessenger as `0x${string}`,
+      abi: TOKEN_MESSENGER_ABI,
+      functionName: "depositForBurnWithHook",
+      args: [
+        params.amountSubunits,
+        params.destinationDomain,
+        params.mintRecipientBytes32 as `0x${string}`,
+        CCTP_CONTRACTS.polygon.usdc as `0x${string}`,
+        params.destinationCallerBytes32 as `0x${string}`,
+        BigInt(0),
+        0,
+        params.hookData as `0x${string}`
+      ],
+      account
+    });
+  } else {
+    hash = await walletClient.writeContract({
+      address: CCTP_CONTRACTS.polygon.tokenMessenger as `0x${string}`,
+      abi: TOKEN_MESSENGER_ABI,
+      functionName: "depositForBurn",
+      args: [
+        params.amountSubunits,
+        params.destinationDomain,
+        params.mintRecipientBytes32 as `0x${string}`,
+        CCTP_CONTRACTS.polygon.usdc as `0x${string}`
+      ],
+      account
+    });
+  }
+
+  const receipt = await publicClient.waitForTransactionReceipt({ hash });
+  return { hash, blockNumber: receipt.blockNumber.toString() };
+}
+
+export async function mintOnPolygon(params: {
+  messageHex: string;
+  attestationHex: string;
+  privateKeyHex: string;
+  rpcUrl?: string;
+}) {
+  const { publicClient, walletClient, account } = getPolygonClients(params.privateKeyHex, params.rpcUrl);
+
+  const request = await publicClient.simulateContract({
+    address: CCTP_CONTRACTS.polygon.messageTransmitter as `0x${string}`,
+    abi: MESSAGE_TRANSMITTER_ABI,
+    functionName: 'receiveMessage',
+    args: [
+      params.messageHex.startsWith('0x') ? params.messageHex as `0x${string}` : `0x${params.messageHex}`,
+      params.attestationHex.startsWith('0x') ? params.attestationHex as `0x${string}` : `0x${params.attestationHex}`
+    ],
+    account
+  });
+
+  const hash = await walletClient.writeContract(request.request);
+  const receipt = await publicClient.waitForTransactionReceipt({ hash });
+  return { hash, blockNumber: receipt.blockNumber.toString() };
 }

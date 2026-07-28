@@ -2,329 +2,377 @@
 
 import { usePollar } from "@pollar/react";
 import { useState } from "react";
-import { parseUnits } from "viem";
-import { createWalletClient, http, publicActions } from "viem";
-import { privateKeyToAccount } from "viem/accounts";
-import { polygonAmoy } from "viem/chains";
-import { CCTP_CONTRACTS } from "../../../../packages/engine/src/config";
-import { buildStellarMintXdr, buildStellarBurnXdr, buildCctpForwarderHookData, contractStrkeyToBytes32, buildFullStellarMintTx, buildFullStellarBurnTx, buildFullStellarApproveTx } from "../../../../packages/engine/src/chains/stellar";
+import { CCTP_CONTRACTS, buildFullStellarApproveTx, buildFullStellarBurnTx, buildFullStellarMintTx } from "@usdc-treasury/engine";
 
-// EVM ABI just for depositForBurnWithHook
-const TOKEN_MESSENGER_ABI = [
-  {
-    type: "function",
-    name: "depositForBurnWithHook",
-    stateMutability: "nonpayable",
-    inputs: [
-      { name: "amount", type: "uint256" },
-      { name: "destinationDomain", type: "uint32" },
-      { name: "mintRecipient", type: "bytes32" },
-      { name: "burnToken", type: "address" },
-      { name: "destinationCaller", type: "bytes32" },
-      { name: "maxFee", type: "uint256" },
-      { name: "minFinalityThreshold", type: "uint32" },
-      { name: "hookData", type: "bytes" }
-    ],
-    outputs: [{ type: "uint64" }]
-  }
-] as const;
-
-const ERC20_ABI = [
-  {
-    type: "function",
-    name: "approve",
-    stateMutability: "nonpayable",
-    inputs: [
-      { name: "spender", type: "address" },
-      { name: "amount", type: "uint256" }
-    ],
-    outputs: [{ type: "bool" }]
-  }
-] as const;
-
-export default function Home() {
+export default function TreasuryDashboard() {
   const pollar = usePollar();
-  const [logs, setLogs] = useState<string[]>([]);
-  const [isBurning, setIsBurning] = useState(false);
-  const [isMinting, setIsMinting] = useState(false);
-  const [isBurningStellar, setIsBurningStellar] = useState(false);
-  const [isMintingPolygon, setIsMintingPolygon] = useState(false);
-  const [mintMessage, setMintMessage] = useState<{ message: string; attestation: string } | null>(null);
-  const [polygonMintMessage, setPolygonMintMessage] = useState<{ message: string; attestation: string } | null>(null);
+  const [logs, setLogs] = useState<{message: string, type: 'info' | 'success' | 'error'}[]>([]);
+  const [isProcessing, setIsProcessing] = useState(false);
+  
+  const [fromChain, setFromChain] = useState<string>("polygon");
+  const [toChain, setToChain] = useState<string>("solana");
+  const [amount, setAmount] = useState<string>("1"); // In USDC
+  
+  const log = (message: string, type: 'info' | 'success' | 'error' = 'info') => {
+    setLogs((prev) => [...prev, { message, type }]);
+  };
 
-  const log = (msg: string) => setLogs((prev) => [...prev, msg]);
-
-  // Spike 2.1: Polygon -> Stellar
-  const handlePolygonToStellar = async () => {
-    setIsBurning(true);
+  const handleManualTransfer = async () => {
+    setIsProcessing(true);
     setLogs([]);
     try {
-      const pollarWallet = pollar.wallet?.address;
-      if (!pollarWallet) {
-        throw new Error("Pollar wallet not connected/found. Wait for initialization.");
+      // 6 decimals for EVM/Solana, 7 for Stellar. 
+      let amountSubunitsEVM = BigInt(parseFloat(amount) * 1_000_000);
+      let amountSubunitsStellar = BigInt(parseFloat(amount) * 10_000_000);
+
+      const sourceDomain = CCTP_CONTRACTS[fromChain as keyof typeof CCTP_CONTRACTS]?.domain;
+      const destinationDomain = CCTP_CONTRACTS[toChain as keyof typeof CCTP_CONTRACTS]?.domain;
+
+      if (sourceDomain === undefined || destinationDomain === undefined) throw new Error("Invalid chains selected");
+
+      if (fromChain === "stellar") {
+        if (!pollar.wallet?.address) throw new Error("Please connect Pollar wallet first");
+        
+        log(`Initiating Manual Transfer from Stellar to ${toChain}...`);
+        log("1. Requesting Approve via Pollar...");
+        
+        const approveXdr = await buildFullStellarApproveTx({
+          amountSubunits: amountSubunitsStellar,
+          burnTokenStrkey: CCTP_CONTRACTS.stellar.usdc,
+          sourceAccountPubkey: pollar.wallet.address
+        });
+        
+        const approveResult = await pollar.signAndSubmitTx(approveXdr);
+        if (approveResult.status === "error") throw new Error(approveResult.details || "Approve failed");
+        log(`Approve success: ${approveResult.hash}`, 'success');
+        await new Promise(r => setTimeout(r, 2000));
+
+        log("2. Requesting Burn via Pollar...");
+        const recipientAddress = "0x0279A7D9f93805A9D0bF7bb7a88A99D7392934AC"; 
+        const mintRecipientBytes32 = recipientAddress.replace("0x", "").padStart(64, "0"); 
+
+        const unsignedXdr = await buildFullStellarBurnTx({
+          amountSubunits: amountSubunitsStellar,
+          destinationDomain,
+          mintRecipientBytes32,
+          burnTokenStrkey: CCTP_CONTRACTS.stellar.usdc,
+          sourceAccountPubkey: pollar.wallet.address
+        });
+
+        const burnResult = await pollar.signAndSubmitTx(unsignedXdr);
+        if (burnResult.status === "error") throw new Error(burnResult.details || "Burn failed");
+        log(`Burn success: ${burnResult.hash}`, 'success');
+
+        log("3. Passing to Backend to poll and mint...");
+        const response = await fetch('/api/transfer', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            action: 'mint',
+            sourceDomain,
+            destinationDomain,
+            txHash: burnResult.hash,
+          })
+        });
+        const data = await response.json();
+        if (data.error) throw new Error(data.error);
+        log(`Transfer Complete! Mint Hash: ${data.hash}`, 'success');
+
+      } else {
+        log(`Initiating Automated Backend Transfer from ${fromChain} to ${toChain}...`);
+        
+        const recipientAddress = "0x0279A7D9f93805A9D0bF7bb7a88A99D7392934AC";
+        const mintRecipientBytes32 = recipientAddress.replace("0x", "").padStart(64, "0"); 
+        
+        const response = await fetch('/api/transfer', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            action: 'full_transfer',
+            sourceDomain,
+            destinationDomain,
+            amount: amountSubunitsEVM.toString(),
+            mintRecipientBytes32
+          })
+        });
+        const data = await response.json();
+        if (data.error) throw new Error(data.error);
+
+        if (data.needsClientMint) {
+          log(`Burn and poll complete on backend. Proceeding to Client-Side Mint on Stellar...`, 'success');
+          if (!pollar.wallet?.address) throw new Error("Please connect Pollar wallet first");
+          const unsignedXdr = await buildFullStellarMintTx({
+            messageHex: data.messageHex,
+            attestationHex: data.attestationHex,
+            sourceAccountPubkey: pollar.wallet.address
+          });
+          const mintResult = await pollar.signAndSubmitTx(unsignedXdr);
+          if (mintResult.status === "error") throw new Error(mintResult.details || "Mint failed");
+          log(`Stellar Mint Complete! Hash: ${mintResult.hash}`, 'success');
+        } else {
+          log(`Transfer Complete! Burn Hash: ${data.burnHash}, Mint Hash: ${data.mintHash}`, 'success');
+        }
       }
-      log(`Pollar Treasury Wallet: ${pollarWallet}`);
-
-      // 1. Burn on Polygon
-      log("Initializing Polygon wallet...");
-      const account = privateKeyToAccount(process.env.NEXT_PUBLIC_POLYGON_PRIVATE_KEY as `0x${string}`);
-      const client = createWalletClient({
-        account,
-        chain: polygonAmoy,
-        transport: http("https://polygon-amoy.drpc.org")
-      }).extend(publicActions);
-
-      const amount = parseUnits("1", 6); // 1 USDC
-      const forwarderBytes32 = contractStrkeyToBytes32(CCTP_CONTRACTS.stellar.cctpForwarder);
-      const hookData = buildCctpForwarderHookData(pollarWallet);
-
-      log("Approving USDC spend...");
-      const approveHash = await client.writeContract({
-        address: CCTP_CONTRACTS.polygon.usdc as `0x${string}`,
-        abi: ERC20_ABI,
-        functionName: "approve",
-        args: [
-          CCTP_CONTRACTS.polygon.tokenMessenger as `0x${string}`,
-          amount
-        ]
-      });
-      log(`Approve tx sent: ${approveHash}. Waiting for receipt...`);
-      await client.waitForTransactionReceipt({ hash: approveHash });
-      log("Approve confirmed.");
-
-      log("Submitting depositForBurnWithHook on Polygon...");
-      const hash = await client.writeContract({
-        address: CCTP_CONTRACTS.polygon.tokenMessenger as `0x${string}`,
-        abi: TOKEN_MESSENGER_ABI,
-        functionName: "depositForBurnWithHook",
-        args: [
-          amount,
-          CCTP_CONTRACTS.stellar.domain,
-          forwarderBytes32 as `0x${string}`,
-          CCTP_CONTRACTS.polygon.usdc as `0x${string}`,
-          forwarderBytes32 as `0x${string}`,
-          BigInt(0), // maxFee
-          0, // minFinalityThreshold
-          hookData as `0x${string}`
-        ]
-      });
-
-      log(`Burn tx sent: ${hash}. Waiting for receipt...`);
-      const receipt = await client.waitForTransactionReceipt({ hash });
-      log(`Burn confirmed in block ${receipt.blockNumber}.`);
-
-      // 2. Fetch attestation
-      log("Waiting for Circle attestation...");
-      const attestation = await waitForAttestation(CCTP_CONTRACTS.polygon.domain, hash);
-      log("Attestation received!");
-      setMintMessage(attestation);
     } catch (e: any) {
-      log(`Error: ${e.message}`);
-      console.error(e);
+      log(`Error: ${e.message}`, 'error');
     } finally {
-      setIsBurning(false);
-    }
-  };
-
-  const handleMintOnStellar = async () => {
-    if (!mintMessage) return;
-    setIsMinting(true);
-    try {
-      log("Building Stellar Mint Tx locally...");
-      if (!pollar.wallet?.address) throw new Error("Pollar wallet not connected");
-
-      log("Ensuring USDC trustline exists...");
-      const tl = await pollar.setTrustline({ 
-        code: "USDC",
-        issuer: "GBBD47IF6LWK7P7MDEVSCWR7DPUWV3NY3DTQEVFL4NAT4AQH3ZLLFLA5"
-      });
-      log(`Trustline outcome: ${JSON.stringify(tl)}`);
-      if (tl.status === "error") {
-        throw new Error(tl.details || "Unknown trustline error");
-      }
-      
-      // Give Horizon/Soroban 2 seconds to index the new trustline before simulating
-      await new Promise(r => setTimeout(r, 2000));
-
-      const unsignedXdr = await buildFullStellarMintTx({
-        messageHex: mintMessage.message,
-        attestationHex: mintMessage.attestation,
-        sourceAccountPubkey: pollar.wallet.address
-      });
-
-      log("Submitting to Pollar...");
-      const result = await pollar.signAndSubmitTx(unsignedXdr);
-      if (result.status === "error") {
-        throw new Error(result.message || result.details || "Unknown error");
-      }
-      log(`Stellar Mint success! Hash: ${result.hash}`);
-    } catch (e: any) {
-      log(`Error: ${e.message}`);
-      console.error(e);
-    } finally {
-      setIsMinting(false);
-    }
-  };
-
-  // Spike 3: Stellar -> Polygon
-  const handleStellarToPolygon = async () => {
-    setIsBurningStellar(true);
-    setLogs([]);
-    try {
-      if (!pollar.wallet?.address) throw new Error("Pollar wallet not connected");
-      log(`Initiating Burn on Stellar from: ${pollar.wallet.address}`);
-
-      log("Building Stellar Burn Tx locally...");
-      
-      const amountSubunits = BigInt(10000000); // 1 USDC in Stellar stroops (7 decimals)
-      const recipientAddress = "0x0279A7D9f93805A9D0bF7bb7a88A99D7392934AC"; // Backend wallet address (cannot mint to USDC contract itself)
-      // Pad EVM address to 32 bytes
-      const mintRecipientBytes32 = recipientAddress.replace("0x", "").padStart(64, "0");
-
-      log("Building Stellar Approve Tx locally...");
-      const approveXdr = await buildFullStellarApproveTx({
-        amountSubunits,
-        burnTokenStrkey: CCTP_CONTRACTS.stellar.usdc,
-        sourceAccountPubkey: pollar.wallet.address
-      });
-
-      log("Submitting Approve to Pollar...");
-      const approveResult = await pollar.signAndSubmitTx(approveXdr);
-      if (approveResult.status === "error") {
-        throw new Error(approveResult.message || approveResult.details || "Approve failed");
-      }
-      log(`Stellar Approve success! Hash: ${approveResult.hash}`);
-      
-      // Wait a few seconds for the network to index the approve
-      await new Promise(r => setTimeout(r, 2000));
-
-      log("Building Stellar Burn Tx locally...");
-      const unsignedXdr = await buildFullStellarBurnTx({
-        amountSubunits,
-        destinationDomain: CCTP_CONTRACTS.polygon.domain,
-        mintRecipientBytes32,
-        burnTokenStrkey: CCTP_CONTRACTS.stellar.usdc,
-        sourceAccountPubkey: pollar.wallet.address
-      });
-
-      log("Submitting Burn to Pollar...");
-      const result = await pollar.signAndSubmitTx(unsignedXdr);
-      if (result.status === "error") {
-        throw new Error(result.message || result.details || "Burn failed");
-      }
-      log(`Stellar Burn success! Hash: ${result.hash}`);
-
-      // 2. Fetch attestation
-      log("Waiting for Circle attestation...");
-      const attestation = await waitForAttestation(CCTP_CONTRACTS.stellar.domain, result.hash);
-      log("Attestation received!");
-      setPolygonMintMessage(attestation);
-
-    } catch (e: any) {
-      log(`Error: ${e.message}`);
-      console.error(e);
-    } finally {
-      setIsBurningStellar(false);
-    }
-  };
-
-  const handleMintOnPolygon = async () => {
-    if (!polygonMintMessage) return;
-    setIsMintingPolygon(true);
-    try {
-      log("Submitting mint payload to backend API...");
-      
-      const response = await fetch('/api/mint', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          messageHex: polygonMintMessage.message,
-          attestationHex: polygonMintMessage.attestation
-        })
-      });
-
-      const data = await response.json();
-      if (!response.ok || data.error) {
-        throw new Error(data.error || "Backend error");
-      }
-
-      log(`Polygon Mint success! Hash: ${data.hash}`);
-    } catch (e: any) {
-      log(`Error: ${e.message}`);
-      console.error(e);
-    } finally {
-      setIsMintingPolygon(false);
+      setIsProcessing(false);
     }
   };
 
   return (
-    <main className="p-8 font-mono">
-      <h1 className="text-2xl font-bold mb-4">Spike 2: Pollar Treasury (Polygon ↔ Stellar)</h1>
-      <p className="mb-4 text-xs text-gray-500">API Key: {process.env.NEXT_PUBLIC_POLLAR_API_KEY?.slice(0, 15)}...</p>
-      
-      <div className="flex gap-4 mb-8 items-center">
+    <main className="min-h-screen font-sans selection:bg-blue-100">
+      {/* Top Navigation Bar */}
+      <header className="bg-white border-b border-gray-200 px-8 py-4 flex justify-between items-center sticky top-0 z-10">
+        <div className="flex items-center gap-3">
+          <div className="w-8 h-8 bg-pollar-blue rounded-lg flex items-center justify-center text-white font-bold text-lg">
+            T
+          </div>
+          <h1 className="text-xl font-semibold text-gray-900 tracking-tight">
+            Treasury Engine
+          </h1>
+        </div>
         <button 
           onClick={() => pollar.openLoginModal()} 
-          className="px-4 py-2 bg-gray-800 text-white rounded hover:bg-gray-700"
+          className="px-5 py-2 bg-white border border-gray-300 rounded-full hover:bg-gray-50 text-sm font-medium text-gray-700 transition-all shadow-sm flex items-center gap-2"
         >
-          {pollar.configStatus === 'loading' ? 'Cargando Pollar...' : 
-           pollar.wallet?.address ? `Conectado: ${pollar.wallet.address.slice(0,6)}...` : 
-           "Login Pollar"}
+          {pollar.configStatus === 'loading' ? 'Loading...' : 
+           pollar.wallet?.address ? (
+             <><span className="w-2 h-2 rounded-full bg-green-500"></span> {pollar.wallet.address.slice(0,6)}...{pollar.wallet.address.slice(-4)}</>
+           ) : "Connect Wallet"}
         </button>
+      </header>
 
-        <button 
-          onClick={handlePolygonToStellar} 
-          disabled={isBurning}
-          className="px-4 py-2 bg-blue-600 text-white rounded hover:bg-blue-700 disabled:opacity-50"
-        >
-          {isBurning ? "Quemando..." : "1. Quemar 1 USDC en Polygon"}
-        </button>
+      <div className="max-w-7xl mx-auto px-8 py-8">
+        <div className="mb-8">
+          <h2 className="text-2xl font-bold text-gray-900 mb-1">Inventory Dashboard</h2>
+          <p className="text-gray-500 text-sm">Live USDC liquidity across integrated networks.</p>
+        </div>
 
-        <button 
-          onClick={handleMintOnStellar} 
-          disabled={isMinting || !mintMessage}
-          className="px-4 py-2 bg-green-600 text-white rounded hover:bg-green-700 disabled:opacity-50"
-        >
-          {isMinting ? "Recibiendo..." : "2. Recibir USDC en Stellar"}
-        </button>
-      </div>
+        {/* Inventory Cards */}
+        <div className="grid grid-cols-1 md:grid-cols-3 gap-6 mb-10">
+          
+          {/* Polygon Card */}
+          <div className="bg-white rounded-2xl p-6 border border-gray-200 shadow-sm hover:shadow-md transition-shadow">
+            <div className="flex justify-between items-start mb-6">
+              <div className="flex items-center gap-3">
+                <div className="w-10 h-10 rounded-full bg-purple-50 flex items-center justify-center">
+                  <svg className="w-5 h-5 text-purple-600" fill="currentColor" viewBox="0 0 24 24"><path d="M12 0L22.5 6V18L12 24L1.5 18V6L12 0ZM12 4.5L5.5 8.25V15.75L12 19.5L18.5 15.75V8.25L12 4.5Z"/></svg>
+                </div>
+                <div>
+                  <h3 className="font-semibold text-gray-900">Polygon</h3>
+                  <p className="text-xs text-gray-500">Amoy Testnet</p>
+                </div>
+              </div>
+              <span className="px-2.5 py-1 bg-purple-50 text-purple-700 text-xs font-semibold rounded-full border border-purple-100">
+                EVM
+              </span>
+            </div>
+            
+            <div className="mb-4">
+              <span className="text-3xl font-bold text-gray-900 tracking-tight">--</span>
+              <span className="text-gray-500 font-medium ml-2">USDC</span>
+            </div>
+            
+            <div className="space-y-2">
+              <div className="flex justify-between text-xs font-medium text-gray-500">
+                <span>Min: 10</span>
+                <span className="text-gray-900">Target: 50</span>
+                <span>Max: 100</span>
+              </div>
+              <div className="w-full bg-gray-100 rounded-full h-1.5 overflow-hidden">
+                <div className="bg-pollar-blue h-full rounded-full transition-all duration-500" style={{ width: '45%' }}></div>
+              </div>
+            </div>
+          </div>
 
-      <div className="flex gap-4 mb-8 items-center border-t border-gray-700 pt-4 mt-4">
-        <button 
-          onClick={handleStellarToPolygon} 
-          disabled={isBurningStellar}
-          className="px-4 py-2 bg-orange-600 text-white rounded hover:bg-orange-700 disabled:opacity-50"
-        >
-          {isBurningStellar ? "Quemando..." : "3. Quemar 1 USDC en Stellar"}
-        </button>
+          {/* Solana Card */}
+          <div className="bg-white rounded-2xl p-6 border border-gray-200 shadow-sm hover:shadow-md transition-shadow">
+            <div className="flex justify-between items-start mb-6">
+              <div className="flex items-center gap-3">
+                <div className="w-10 h-10 rounded-full bg-green-50 flex items-center justify-center">
+                  <svg className="w-5 h-5 text-green-500" fill="currentColor" viewBox="0 0 24 24"><path d="M19.92 8.76L17.26 4.15H4.1L6.76 8.76H19.92ZM19.92 19.85L17.26 15.24H4.1L6.76 19.85H19.92ZM4.08 14.3H17.24L19.9 9.69H6.74L4.08 14.3Z"/></svg>
+                </div>
+                <div>
+                  <h3 className="font-semibold text-gray-900">Solana</h3>
+                  <p className="text-xs text-gray-500">Devnet</p>
+                </div>
+              </div>
+              <span className="px-2.5 py-1 bg-green-50 text-green-700 text-xs font-semibold rounded-full border border-green-100">
+                SVM
+              </span>
+            </div>
+            
+            <div className="mb-4">
+              <span className="text-3xl font-bold text-gray-900 tracking-tight">--</span>
+              <span className="text-gray-500 font-medium ml-2">USDC</span>
+            </div>
+            
+            <div className="space-y-2">
+              <div className="flex justify-between text-xs font-medium text-gray-500">
+                <span>Min: 10</span>
+                <span className="text-gray-900">Target: 50</span>
+                <span>Max: 100</span>
+              </div>
+              <div className="w-full bg-gray-100 rounded-full h-1.5 overflow-hidden">
+                <div className="bg-yellow-400 h-full rounded-full transition-all duration-500" style={{ width: '20%' }}></div>
+              </div>
+            </div>
+          </div>
 
-        <button 
-          onClick={handleMintOnPolygon} 
-          disabled={isMintingPolygon || !polygonMintMessage}
-          className="px-4 py-2 bg-purple-600 text-white rounded hover:bg-purple-700 disabled:opacity-50"
-        >
-          {isMintingPolygon ? "Recibiendo..." : "4. Recibir USDC en Polygon (API)"}
-        </button>
-      </div>
+          {/* Stellar Card - Highlighted/Active State from Design */}
+          <div className="bg-pollar-blue rounded-2xl p-6 shadow-md shadow-pollar-blue-dark/20 text-white relative overflow-hidden">
+            <div className="absolute top-0 right-0 w-32 h-32 bg-white/10 rounded-full -mr-10 -mt-10 blur-2xl"></div>
+            
+            <div className="flex justify-between items-start mb-6 relative z-10">
+              <div className="flex items-center gap-3">
+                <div className="w-10 h-10 rounded-full bg-white/20 flex items-center justify-center backdrop-blur-sm">
+                  <svg className="w-5 h-5 text-white" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M12 2L2 7l10 5 10-5-10-5zM2 17l10 5 10-5M2 12l10 5 10-5"></path></svg>
+                </div>
+                <div>
+                  <h3 className="font-semibold text-white">Stellar</h3>
+                  <p className="text-xs text-blue-100">Testnet</p>
+                </div>
+              </div>
+              <span className="px-2.5 py-1 bg-white/20 text-white text-xs font-semibold rounded-full backdrop-blur-sm">
+                Soroban
+              </span>
+            </div>
+            
+            <div className="mb-4 relative z-10">
+              <span className="text-3xl font-bold tracking-tight">--</span>
+              <span className="text-blue-100 font-medium ml-2">USDC</span>
+            </div>
+            
+            <div className="space-y-2 relative z-10">
+              <div className="flex justify-between text-xs font-medium text-blue-100">
+                <span>Min: 10</span>
+                <span className="text-white">Target: 50</span>
+                <span>Max: 100</span>
+              </div>
+              <div className="w-full bg-black/20 rounded-full h-1.5 overflow-hidden">
+                <div className="bg-white h-full rounded-full transition-all duration-500" style={{ width: '85%' }}></div>
+              </div>
+            </div>
+          </div>
+        </div>
 
-      <div className="bg-gray-900 text-green-400 p-4 rounded min-h-[300px]">
-        {logs.map((l, i) => <div key={i}>{l}</div>)}
-        {logs.length === 0 && <span className="opacity-50">Esperando acciones...</span>}
+        <div className="grid grid-cols-1 lg:grid-cols-5 gap-6">
+          {/* Manual Rebalance Form */}
+          <div className="lg:col-span-2 bg-white border border-gray-200 rounded-2xl p-6 shadow-sm">
+            <h3 className="text-lg font-semibold text-gray-900 mb-6">Manual Rebalance</h3>
+            
+            <div className="space-y-5">
+              <div className="grid grid-cols-2 gap-4">
+                <div>
+                  <label className="block text-sm font-medium text-gray-700 mb-1.5">Source</label>
+                  <div className="relative">
+                    <select 
+                      value={fromChain} 
+                      onChange={(e) => setFromChain(e.target.value)}
+                      className="w-full appearance-none bg-white border border-gray-300 rounded-xl px-4 py-2.5 text-sm text-gray-900 focus:outline-none focus:ring-2 focus:ring-pollar-blue/20 focus:border-pollar-blue transition-shadow"
+                    >
+                      <option value="polygon">Polygon</option>
+                      <option value="solana">Solana</option>
+                      <option value="stellar">Stellar</option>
+                    </select>
+                    <div className="pointer-events-none absolute inset-y-0 right-0 flex items-center px-4 text-gray-500">
+                      <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M19 9l-7 7-7-7"></path></svg>
+                    </div>
+                  </div>
+                </div>
+                
+                <div>
+                  <label className="block text-sm font-medium text-gray-700 mb-1.5">Destination</label>
+                  <div className="relative">
+                    <select 
+                      value={toChain} 
+                      onChange={(e) => setToChain(e.target.value)}
+                      className="w-full appearance-none bg-white border border-gray-300 rounded-xl px-4 py-2.5 text-sm text-gray-900 focus:outline-none focus:ring-2 focus:ring-pollar-blue/20 focus:border-pollar-blue transition-shadow"
+                    >
+                      <option value="polygon">Polygon</option>
+                      <option value="solana">Solana</option>
+                      <option value="stellar">Stellar</option>
+                    </select>
+                    <div className="pointer-events-none absolute inset-y-0 right-0 flex items-center px-4 text-gray-500">
+                      <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M19 9l-7 7-7-7"></path></svg>
+                    </div>
+                  </div>
+                </div>
+              </div>
+              
+              <div>
+                <label className="block text-sm font-medium text-gray-700 mb-1.5">Amount (USDC)</label>
+                <div className="relative">
+                  <div className="absolute inset-y-0 left-0 pl-4 flex items-center pointer-events-none">
+                    <span className="text-gray-500 sm:text-sm">$</span>
+                  </div>
+                  <input 
+                    type="number" 
+                    value={amount} 
+                    onChange={(e) => setAmount(e.target.value)}
+                    className="w-full bg-white border border-gray-300 rounded-xl pl-8 pr-4 py-2.5 text-sm text-gray-900 placeholder-gray-400 focus:outline-none focus:ring-2 focus:ring-pollar-blue/20 focus:border-pollar-blue transition-shadow"
+                    placeholder="0.00"
+                  />
+                </div>
+              </div>
+
+              <div className="pt-2">
+                <button 
+                  onClick={handleManualTransfer}
+                  disabled={isProcessing || fromChain === toChain}
+                  className="w-full py-3 px-4 bg-pollar-blue hover:bg-pollar-blue-dark text-white disabled:opacity-50 disabled:hover:bg-pollar-blue disabled:cursor-not-allowed rounded-full text-sm font-semibold transition-colors shadow-sm flex justify-center items-center gap-2"
+                >
+                  {isProcessing ? (
+                    <>
+                      <svg className="animate-spin h-4 w-4 text-white" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24"><circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4"></circle><path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"></path></svg>
+                      Processing...
+                    </>
+                  ) : "Execute Transfer"}
+                </button>
+              </div>
+            </div>
+          </div>
+
+          {/* Engine Logs Table Style */}
+          <div className="lg:col-span-3 bg-white border border-gray-200 rounded-2xl p-6 shadow-sm flex flex-col h-[400px]">
+            <div className="flex justify-between items-center mb-4">
+              <h3 className="text-lg font-semibold text-gray-900">Activity Log</h3>
+              <span className="px-2.5 py-1 bg-gray-100 text-gray-600 text-xs font-medium rounded-full">Live</span>
+            </div>
+            
+            <div className="flex-1 overflow-y-auto border border-gray-100 rounded-xl bg-gray-50/50 p-4 font-mono text-xs">
+              <div className="space-y-3">
+                {logs.map((log, i) => {
+                  let badgeClass = "bg-gray-100 text-gray-600 border-gray-200";
+                  let Icon = () => <span className="mr-2 text-gray-400">›</span>;
+                  
+                  if (log.type === 'success') {
+                    badgeClass = "bg-green-50 text-green-700 border-green-200";
+                    Icon = () => <span className="mr-2 text-green-500">✓</span>;
+                  } else if (log.type === 'error') {
+                    badgeClass = "bg-red-50 text-red-700 border-red-200";
+                    Icon = () => <span className="mr-2 text-red-500">×</span>;
+                  }
+
+                  return (
+                    <div key={i} className={`p-3 rounded-lg border ${badgeClass} break-all flex items-start`}>
+                      <Icon />
+                      <span className="mt-0.5">{log.message}</span>
+                    </div>
+                  );
+                })}
+                {logs.length === 0 && (
+                  <div className="text-center text-gray-400 py-10 flex flex-col items-center justify-center">
+                    <svg className="w-8 h-8 mb-3 text-gray-300" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="1.5" d="M9 12h6m-6 4h6m2 5H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z"></path></svg>
+                    Waiting for engine activity...
+                  </div>
+                )}
+              </div>
+            </div>
+          </div>
+        </div>
       </div>
     </main>
   );
-}
-
-// Helper to poll Iris API
-async function waitForAttestation(sourceDomain: number, txHash: string) {
-  const url = `https://iris-api-sandbox.circle.com/v2/messages/${sourceDomain}?transactionHash=${txHash}`;
-  while (true) {
-    const res = await fetch(url);
-    if (res.ok) {
-      const data = await res.json();
-      const complete = data.messages?.find((m: any) => m.status === "complete");
-      if (complete) return complete;
-    }
-    await new Promise(r => setTimeout(r, 5000));
-  }
 }
