@@ -6,10 +6,11 @@ import bs58 from 'bs58';
 
 export const dynamic = 'force-dynamic';
 
-export async function GET(request: Request) {
+export async function GET() {
   try {
-    const { searchParams } = new URL(request.url);
-    const stellarAddress = searchParams.get('stellarAddress') || '';
+    // Fixed, independent of whoever is connected via Pollar in the browser -
+    // that connection now represents a customer (P1), not the treasury.
+    const stellarAddress = process.env.TREASURY_STELLAR_ADDRESS || '';
 
     let polygonAddress = '';
     const polyKey = process.env.POLYGON_PRIVATE_KEY;
@@ -27,7 +28,7 @@ export async function GET(request: Request) {
     const balances = await getTreasuryBalances({
       polygonAddress,
       solanaAddress,
-      stellarAddress, // Passed from frontend Pollar wallet
+      stellarAddress,
     });
 
     return NextResponse.json({

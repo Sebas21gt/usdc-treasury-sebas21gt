@@ -65,6 +65,16 @@ const ERC20_ABI = [
       { name: "spender", type: "address" }
     ],
     outputs: [{ type: "uint256" }]
+  },
+  {
+    type: "function",
+    name: "transfer",
+    stateMutability: "nonpayable",
+    inputs: [
+      { name: "to", type: "address" },
+      { name: "amount", type: "uint256" }
+    ],
+    outputs: [{ type: "bool" }]
   }
 ] as const;
 
@@ -219,6 +229,28 @@ export async function mintOnPolygon(params: {
       ]
     }),
     account
+  });
+  const receipt = await publicClient.waitForTransactionReceipt({ hash });
+  return { hash, blockNumber: receipt.blockNumber.toString() };
+}
+
+// Plain ERC20 transfer - no CCTP involved. Used by the "simulated P2P
+// payment" demo feature (treasury crediting P2 on Polygon), not by the
+// actual rebalance engine.
+export async function payUsdcOnPolygon(params: {
+  amountSubunits: bigint;
+  toAddress: string;
+  privateKeyHex: string;
+  rpcUrl?: string;
+}) {
+  const { publicClient, walletClient, account } = getPolygonClients(params.privateKeyHex, params.rpcUrl);
+
+  const hash = await walletClient.writeContract({
+    address: CCTP_CONTRACTS.polygon.usdc as `0x${string}`,
+    abi: ERC20_ABI,
+    functionName: 'transfer',
+    args: [params.toAddress as `0x${string}`, params.amountSubunits],
+    account,
   });
   const receipt = await publicClient.waitForTransactionReceipt({ hash });
   return { hash, blockNumber: receipt.blockNumber.toString() };

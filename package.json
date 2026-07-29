@@ -7,7 +7,8 @@
     "lint": "turbo lint",
     "type-check": "turbo type-check",
     "spike:evm-solana": "ts-node --project scripts/tsconfig.json scripts/spike-evm-solana.ts",
-    "monitor": "ts-node --project scripts/tsconfig.json scripts/monitor.ts"
+    "monitor": "ts-node --project scripts/tsconfig.json scripts/monitor.ts",
+    "automatic": "ts-node --project scripts/tsconfig.json scripts/automatic-mode.ts"
   },
   "devDependencies": {
     "@types/bs58": "^4.0.4",

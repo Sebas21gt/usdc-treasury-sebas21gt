@@ -6,6 +6,7 @@ import {
   TREASURY_CONFIG,
   executeBurn,
   executeMint,
+  payIntoTreasuryFromStellar,
   SupportedChain,
   StellarSignResult,
 } from "@usdc-treasury/engine";
@@ -43,6 +44,21 @@ export default function TreasuryDashboard() {
   const [addresses, setAddresses] = useState({ polygon: '', solana: '', stellar: '' });
   const [isBalancesLoading, setIsBalancesLoading] = useState(true);
   const [history, setHistory] = useState<MovementRecord[]>([]);
+  const [addressCopied, setAddressCopied] = useState(false);
+
+  const copyConnectedAddress = async () => {
+    if (!pollar.wallet?.address) return;
+    await navigator.clipboard.writeText(pollar.wallet.address);
+    setAddressCopied(true);
+    setTimeout(() => setAddressCopied(false), 1500);
+  };
+
+  // Simulated P2P payment (demo only, no CCTP): P1 (connected wallet) pays
+  // the treasury on Stellar, treasury instantly credits P2 elsewhere.
+  const [sendToChain, setSendToChain] = useState<"polygon" | "solana">("polygon");
+  const [sendDestinationAddress, setSendDestinationAddress] = useState("");
+  const [sendAmount, setSendAmount] = useState("1");
+  const [isSending, setIsSending] = useState(false);
 
   const fetchHistory = async () => {
     try {
@@ -55,11 +71,9 @@ export default function TreasuryDashboard() {
   };
 
   useEffect(() => {
-    let interval: any;
     const fetchBalances = async () => {
       try {
-        const url = `/api/inventory${pollar.wallet?.address ? `?stellarAddress=${pollar.wallet.address}` : ''}`;
-        const res = await fetch(url);
+        const res = await fetch('/api/inventory');
         const data = await res.json();
         if (data && !data.error) {
           setBalances(data);
@@ -73,13 +87,18 @@ export default function TreasuryDashboard() {
     };
 
     fetchBalances();
-    interval = setInterval(fetchBalances, 15000); // 15 seconds
+    const interval = setInterval(fetchBalances, 15000); // 15 seconds
 
     return () => clearInterval(interval);
-  }, [pollar.wallet?.address]);
+  }, []);
 
   useEffect(() => {
     fetchHistory();
+    // Automatic mode runs as a separate background process and writes
+    // straight to data/history.json, so this needs its own poll - it won't
+    // come through as a side effect of any button click in this tab.
+    const interval = setInterval(fetchHistory, 15000);
+    return () => clearInterval(interval);
   }, []);
 
   const log = (message: string, type: 'info' | 'success' | 'error' = 'info') => {
@@ -175,6 +194,44 @@ export default function TreasuryDashboard() {
     }
   };
 
+  // Simulated P2P payment (demo only): P1 (connected wallet) pays the
+  // treasury on Stellar, the treasury instantly credits P2 elsewhere - no
+  // CCTP on either leg. CCTP only ever rebalances the treasury itself,
+  // via the Manual Rebalance form above or automatic mode.
+  const handleSimulatedSend = async () => {
+    setIsSending(true);
+    try {
+      if (!pollar.wallet?.address) throw new Error("Connect a Pollar wallet first (this is P1, the sender)");
+      if (!addresses.stellar) throw new Error("Treasury address not loaded yet. Please wait for inventory to sync.");
+      if (!sendDestinationAddress) throw new Error("Enter a destination address for P2");
+
+      const parsedAmount = parseFloat(sendAmount);
+
+      log(`P1 paying ${parsedAmount} USDC into the treasury on Stellar...`);
+      const { hash: depositHash } = await payIntoTreasuryFromStellar({
+        stellarWalletAddress: pollar.wallet.address,
+        treasuryStellarAddress: addresses.stellar,
+        amount: parsedAmount,
+        signStellarXdr: makeStellarSigner(pollar),
+      });
+      log(`P1 -> Treasury payment success: ${depositHash}`, 'success');
+
+      log(`Treasury crediting P2 on ${sendToChain} (instant, no CCTP)...`);
+      const response = await fetch('/api/simulated-payment', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ toChain: sendToChain, destinationAddress: sendDestinationAddress, amount: parsedAmount })
+      });
+      const data = await response.json();
+      if (data.error) throw new Error(data.error);
+      log(`Treasury -> P2 payment success: ${data.hash}`, 'success');
+    } catch (e: any) {
+      log(`Error: ${e.message}`, 'error');
+    } finally {
+      setIsSending(false);
+    }
+  };
+
   return (
     <main className="min-h-screen font-sans selection:bg-blue-100">
       {/* Top Navigation Bar */}
@@ -187,15 +244,35 @@ export default function TreasuryDashboard() {
             Treasury Engine
           </h1>
         </div>
-        <button 
-          onClick={() => pollar.openLoginModal()} 
-          className="px-5 py-2 bg-white border border-gray-300 rounded-full hover:bg-gray-50 text-sm font-medium text-gray-700 transition-all shadow-sm flex items-center gap-2"
-        >
-          {pollar.configStatus === 'loading' ? 'Loading...' : 
-           pollar.wallet?.address ? (
-             <><span className="w-2 h-2 rounded-full bg-green-500"></span> {pollar.wallet.address.slice(0,6)}...{pollar.wallet.address.slice(-4)}</>
-           ) : "Connect Wallet"}
-        </button>
+        <div className="flex items-center gap-2">
+          <button
+            onClick={() => pollar.openLoginModal()}
+            className="px-5 py-2 bg-white border border-gray-300 rounded-full hover:bg-gray-50 text-sm font-medium text-gray-700 transition-all shadow-sm flex items-center gap-2"
+          >
+            {pollar.configStatus === 'loading' ? 'Loading...' :
+             pollar.wallet?.address ? (
+               <><span className="w-2 h-2 rounded-full bg-green-500"></span> {pollar.wallet.address.slice(0,6)}...{pollar.wallet.address.slice(-4)}</>
+             ) : "Connect Wallet"}
+          </button>
+          {pollar.wallet?.address && (
+            <>
+              <button
+                onClick={copyConnectedAddress}
+                className="px-3 py-2 text-xs text-gray-500 hover:text-gray-700 underline"
+                title="Copy the full connected address (to fund it via a faucet)"
+              >
+                {addressCopied ? "Copied!" : "Copy address"}
+              </button>
+              <button
+                onClick={() => pollar.logout()}
+                className="px-3 py-2 text-xs text-gray-500 hover:text-gray-700 underline"
+                title="Sign out to switch to a different Pollar account"
+              >
+                Log out
+              </button>
+            </>
+          )}
+        </div>
       </header>
 
       <div className="max-w-7xl mx-auto px-8 py-8">
@@ -309,6 +386,49 @@ export default function TreasuryDashboard() {
                 <div className="bg-white h-full rounded-full transition-all duration-500" style={{ width: `${Math.min((balances.stellar / TREASURY_CONFIG.stellar.max) * 100, 100)}%` }}></div>
               </div>
             </div>
+          </div>
+        </div>
+
+        {/* Movement History */}
+        <div className="mb-10 bg-white border border-gray-200 rounded-2xl p-6 shadow-sm">
+          <h3 className="text-lg font-semibold text-gray-900 mb-6">Movement History</h3>
+
+          <div className="overflow-x-auto">
+            <table className="w-full text-sm text-left">
+              <thead>
+                <tr className="text-xs text-gray-500 border-b border-gray-100">
+                  <th className="pb-3 pr-4 font-medium">Time</th>
+                  <th className="pb-3 pr-4 font-medium">Route</th>
+                  <th className="pb-3 pr-4 font-medium">Amount</th>
+                  <th className="pb-3 pr-4 font-medium">Burn tx</th>
+                  <th className="pb-3 pr-4 font-medium">Mint tx</th>
+                  <th className="pb-3 font-medium">Mode</th>
+                </tr>
+              </thead>
+              <tbody>
+                {history.map((movement) => (
+                  <tr key={movement.id} className="border-b border-gray-50 last:border-0">
+                    <td className="py-3 pr-4 text-gray-500 whitespace-nowrap">{new Date(movement.timestamp).toLocaleString()}</td>
+                    <td className="py-3 pr-4 text-gray-900 font-medium capitalize whitespace-nowrap">{movement.fromChain} → {movement.toChain}</td>
+                    <td className="py-3 pr-4 text-gray-900 whitespace-nowrap">{movement.amount} USDC</td>
+                    <td className="py-3 pr-4">
+                      <a href={explorerUrl(movement.fromChain, movement.burnHash)} target="_blank" rel="noreferrer" className="text-pollar-blue hover:underline font-mono text-xs">
+                        {movement.burnHash.slice(0, 8)}...
+                      </a>
+                    </td>
+                    <td className="py-3 pr-4">
+                      <a href={explorerUrl(movement.toChain, movement.mintHash)} target="_blank" rel="noreferrer" className="text-pollar-blue hover:underline font-mono text-xs">
+                        {movement.mintHash.slice(0, 8)}...
+                      </a>
+                    </td>
+                    <td className="py-3 capitalize text-gray-500">{movement.mode}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+            {history.length === 0 && (
+              <div className="text-center text-gray-400 py-10">No movements recorded yet.</div>
+            )}
           </div>
         </div>
 
@@ -428,46 +548,73 @@ export default function TreasuryDashboard() {
           </div>
         </div>
 
-        {/* Movement History */}
-        <div className="mt-6 bg-white border border-gray-200 rounded-2xl p-6 shadow-sm">
-          <h3 className="text-lg font-semibold text-gray-900 mb-6">Movement History</h3>
+        {/* Section divider - everything below is a visual demo extra, not part of the CCTP engine */}
+        <div className="flex items-center gap-3 mb-4 mt-2">
+          <span className="text-xs font-semibold text-gray-400 uppercase tracking-wide whitespace-nowrap">Extra demo · not part of the treasury engine</span>
+          <div className="flex-1 border-t border-dashed border-gray-300"></div>
+        </div>
 
-          <div className="overflow-x-auto">
-            <table className="w-full text-sm text-left">
-              <thead>
-                <tr className="text-xs text-gray-500 border-b border-gray-100">
-                  <th className="pb-3 pr-4 font-medium">Time</th>
-                  <th className="pb-3 pr-4 font-medium">Route</th>
-                  <th className="pb-3 pr-4 font-medium">Amount</th>
-                  <th className="pb-3 pr-4 font-medium">Burn tx</th>
-                  <th className="pb-3 pr-4 font-medium">Mint tx</th>
-                  <th className="pb-3 font-medium">Mode</th>
-                </tr>
-              </thead>
-              <tbody>
-                {history.map((movement) => (
-                  <tr key={movement.id} className="border-b border-gray-50 last:border-0">
-                    <td className="py-3 pr-4 text-gray-500 whitespace-nowrap">{new Date(movement.timestamp).toLocaleString()}</td>
-                    <td className="py-3 pr-4 text-gray-900 font-medium capitalize whitespace-nowrap">{movement.fromChain} → {movement.toChain}</td>
-                    <td className="py-3 pr-4 text-gray-900 whitespace-nowrap">{movement.amount} USDC</td>
-                    <td className="py-3 pr-4">
-                      <a href={explorerUrl(movement.fromChain, movement.burnHash)} target="_blank" rel="noreferrer" className="text-pollar-blue hover:underline font-mono text-xs">
-                        {movement.burnHash.slice(0, 8)}...
-                      </a>
-                    </td>
-                    <td className="py-3 pr-4">
-                      <a href={explorerUrl(movement.toChain, movement.mintHash)} target="_blank" rel="noreferrer" className="text-pollar-blue hover:underline font-mono text-xs">
-                        {movement.mintHash.slice(0, 8)}...
-                      </a>
-                    </td>
-                    <td className="py-3 capitalize text-gray-500">{movement.mode}</td>
-                  </tr>
-                ))}
-              </tbody>
-            </table>
-            {history.length === 0 && (
-              <div className="text-center text-gray-400 py-10">No movements recorded yet.</div>
-            )}
+        {/* Simulated P2P Payment (demo only, no CCTP) */}
+        <div className="mb-6 bg-gray-50 border-2 border-dashed border-gray-300 rounded-2xl p-6">
+          <div className="flex items-center justify-between mb-1">
+            <h3 className="text-lg font-semibold text-gray-700">Send USDC</h3>
+            <span className="px-2.5 py-1 bg-white text-gray-500 text-xs font-medium rounded-full border border-gray-200">Simulated · no CCTP</span>
+          </div>
+          <p className="text-gray-500 text-sm mb-6">
+            P1 (the connected wallet) pays the treasury on Stellar; the treasury instantly credits P2 on the destination chain
+            from its own liquidity — no cross-chain bridge involved. CCTP only rebalances the treasury itself, separately.
+          </p>
+
+          <div className="grid grid-cols-1 md:grid-cols-4 gap-4 items-end">
+            <div>
+              <label className="block text-sm font-medium text-gray-700 mb-1.5">P1 (sender)</label>
+              <div className="w-full bg-gray-50 border border-gray-200 rounded-xl px-4 py-2.5 text-sm text-gray-600">
+                {pollar.wallet?.address ? `${pollar.wallet.address.slice(0, 6)}...${pollar.wallet.address.slice(-4)}` : "Not connected"}
+              </div>
+            </div>
+
+            <div>
+              <label className="block text-sm font-medium text-gray-700 mb-1.5">P2 destination chain</label>
+              <select
+                value={sendToChain}
+                onChange={(e) => setSendToChain(e.target.value as "polygon" | "solana")}
+                className="w-full appearance-none bg-white border border-gray-300 rounded-xl px-4 py-2.5 text-sm text-gray-900 focus:outline-none focus:ring-2 focus:ring-pollar-blue/20 focus:border-pollar-blue transition-shadow"
+              >
+                <option value="polygon">Polygon</option>
+                <option value="solana">Solana</option>
+              </select>
+            </div>
+
+            <div>
+              <label className="block text-sm font-medium text-gray-700 mb-1.5">P2 address</label>
+              <input
+                type="text"
+                value={sendDestinationAddress}
+                onChange={(e) => setSendDestinationAddress(e.target.value)}
+                placeholder="0x... or a Solana address"
+                className="w-full bg-white border border-gray-300 rounded-xl px-4 py-2.5 text-sm text-gray-900 placeholder-gray-400 focus:outline-none focus:ring-2 focus:ring-pollar-blue/20 focus:border-pollar-blue transition-shadow"
+              />
+            </div>
+
+            <div>
+              <label className="block text-sm font-medium text-gray-700 mb-1.5">Amount (USDC)</label>
+              <input
+                type="number"
+                value={sendAmount}
+                onChange={(e) => setSendAmount(e.target.value)}
+                className="w-full bg-white border border-gray-300 rounded-xl px-4 py-2.5 text-sm text-gray-900 focus:outline-none focus:ring-2 focus:ring-pollar-blue/20 focus:border-pollar-blue transition-shadow"
+              />
+            </div>
+          </div>
+
+          <div className="mt-4">
+            <button
+              onClick={handleSimulatedSend}
+              disabled={isSending || !pollar.wallet?.address || !sendDestinationAddress}
+              className="py-3 px-6 bg-white border border-gray-300 hover:bg-gray-100 text-gray-700 disabled:opacity-50 disabled:cursor-not-allowed rounded-full text-sm font-semibold transition-colors"
+            >
+              {isSending ? "Sending..." : "Send"}
+            </button>
           </div>
         </div>
       </div>

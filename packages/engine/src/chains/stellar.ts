@@ -160,6 +160,56 @@ export async function buildFullStellarBurnTx(params: {
   return preparedTx.toXDR();
 }
 
+// Plain SEP-41 transfer on the USDC token contract - no CCTP involved. Used
+// by the "simulated P2P payment" demo feature (P1 paying into the treasury),
+// not by the actual rebalance engine.
+export async function buildStellarTransferXdr(params: {
+  usdcContractStrkey: string;
+  fromStrkey: string;
+  toStrkey: string;
+  amountSubunits: bigint;
+}) {
+  const contract = new Contract(params.usdcContractStrkey);
+  const args = [
+    Address.fromString(params.fromStrkey).toScVal(),
+    Address.fromString(params.toStrkey).toScVal(),
+    nativeToScVal(params.amountSubunits, { type: 'i128' }),
+  ];
+  return contract.call('transfer', ...args);
+}
+
+export async function buildFullStellarPaymentTx(params: {
+  amountSubunits: bigint;
+  toStrkey: string;
+  sourceAccountPubkey: string;
+}) {
+  const horizon = new Horizon.Server('https://horizon-testnet.stellar.org');
+  const rpcServer = new rpc.Server('https://soroban-testnet.stellar.org');
+  const sourceAccount = await horizon.loadAccount(params.sourceAccountPubkey);
+
+  const op = await buildStellarTransferXdr({
+    usdcContractStrkey: CCTP_CONTRACTS.stellar.usdc,
+    fromStrkey: params.sourceAccountPubkey,
+    toStrkey: params.toStrkey,
+    amountSubunits: params.amountSubunits,
+  });
+
+  const tx = new TransactionBuilder(sourceAccount, {
+    fee: BASE_FEE,
+    networkPassphrase: NETWORK_PASSPHRASE,
+  })
+    .addOperation(op)
+    .setTimeout(180)
+    .build();
+
+  const preparedTx = await rpcServer.prepareTransaction(tx) as any;
+  if (preparedTx.error) {
+    throw new Error(`Failed to simulate Soroban Payment Tx: ${JSON.stringify(preparedTx.error)}`);
+  }
+
+  return preparedTx.toXDR();
+}
+
 export async function buildFullStellarApproveTx(params: {
   amountSubunits: bigint;
   burnTokenStrkey: string;

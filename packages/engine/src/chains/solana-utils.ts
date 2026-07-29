@@ -101,6 +101,13 @@ export const getDepositForBurnPdas = (
     "__event_authority",
     tokenMessengerMinterProgram.programId
   );
+  // Exists only if `owner` is denylisted - deposit_for_burn checks the PDA
+  // is NOT initialized. seeds: ["denylist_account", owner].
+  const denylistAccount = findProgramAddress(
+    "denylist_account",
+    tokenMessengerMinterProgram.programId,
+    [owner]
+  );
 
   return {
     messageTransmitterAccount,
@@ -110,6 +117,7 @@ export const getDepositForBurnPdas = (
     remoteTokenMessengerKey,
     authorityPda,
     eventAuthority,
+    denylistAccount,
   };
 };
 

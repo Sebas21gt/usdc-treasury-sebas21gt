@@ -3,6 +3,7 @@ export * from './core/transfer';
 export * from './core/transferUsdc';
 export * from './core/inventory';
 export * from './core/monitor';
+export * from './core/simulatedPayment';
 // core/history is NOT re-exported here on purpose: it imports Node's `fs`/`path`,
 // and this barrel is also imported by client components (page.tsx). Import it
 // directly from '@usdc-treasury/engine/src/core/history' in server-only code

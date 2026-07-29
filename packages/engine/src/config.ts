@@ -42,3 +42,10 @@ export const TREASURY_CONFIG = {
 } as const;
 
 export type SupportedChain = keyof typeof CCTP_CONTRACTS;
+
+// Automatic mode's own behavior knobs, separate from the per-network levels above.
+export const AUTOMATIC_MODE_CONFIG = {
+  maxAmountPerMove: 30, // whole USDC - caps a single automatic rebalance
+  cooldownMs: 5 * 60 * 1000, // minimum gap between two automatic moves
+  checkIntervalMs: 30_000, // how often the loop re-checks inventory
+} as const;
