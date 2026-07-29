@@ -73,7 +73,9 @@ npm run monitor
 
 Standalone engine process ([`scripts/monitor.ts`](./scripts/monitor.ts)) that reads all three networks' balances every 30s and reports each one's status against its configured min/target/max range. This is separate from the frontend's own balance polling (which is only for the dashboard's display) — it's the read side that automatic mode's rebalance logic will consume.
 
-Automatic mode (threshold-triggered rebalancing loop) and the persisted movement history are still in progress.
+Every completed manual transfer is recorded to `data/history.json` (timestamp, source, destination, amount, burn/mint hashes, mode) and shown in the "Movement History" table on the dashboard, with links to each hash's explorer.
+
+Automatic mode (threshold-triggered rebalancing loop) is still in progress.
 
 ## CCTP v2 Contract Addresses (Testnet)
 

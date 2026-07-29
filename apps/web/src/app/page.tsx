@@ -9,6 +9,9 @@ import {
   SupportedChain,
   StellarSignResult,
 } from "@usdc-treasury/engine";
+// Type-only: core/history uses Node's fs/path server-side, but `import type`
+// is fully erased at compile time, so it never gets bundled for the browser.
+import type { MovementRecord } from "@usdc-treasury/engine/src/core/history";
 
 // Adapts Pollar's signAndSubmitTx to the engine's StellarXdrSigner shape.
 function makeStellarSigner(pollar: ReturnType<typeof usePollar>) {
@@ -19,6 +22,12 @@ function makeStellarSigner(pollar: ReturnType<typeof usePollar>) {
     }
     return { status: "success", hash: result.hash };
   };
+}
+
+function explorerUrl(chain: SupportedChain, hash: string): string {
+  if (chain === "polygon") return `https://amoy.polygonscan.com/tx/${hash}`;
+  if (chain === "solana") return `https://explorer.solana.com/tx/${hash}?cluster=devnet`;
+  return `https://stellar.expert/explorer/testnet/tx/${hash}`;
 }
 
 export default function TreasuryDashboard() {
@@ -33,6 +42,17 @@ export default function TreasuryDashboard() {
   const [balances, setBalances] = useState({ polygon: 0, solana: 0, stellar: 0 });
   const [addresses, setAddresses] = useState({ polygon: '', solana: '', stellar: '' });
   const [isBalancesLoading, setIsBalancesLoading] = useState(true);
+  const [history, setHistory] = useState<MovementRecord[]>([]);
+
+  const fetchHistory = async () => {
+    try {
+      const res = await fetch('/api/history');
+      const data = await res.json();
+      if (data && !data.error) setHistory(data.history);
+    } catch (e) {
+      console.error("Failed to fetch history", e);
+    }
+  };
 
   useEffect(() => {
     let interval: any;
@@ -51,13 +71,17 @@ export default function TreasuryDashboard() {
         setIsBalancesLoading(false);
       }
     };
-    
+
     fetchBalances();
     interval = setInterval(fetchBalances, 15000); // 15 seconds
-    
+
     return () => clearInterval(interval);
   }, [pollar.wallet?.address]);
-  
+
+  useEffect(() => {
+    fetchHistory();
+  }, []);
+
   const log = (message: string, type: 'info' | 'success' | 'error' = 'info') => {
     setLogs((prev) => [...prev, { message, type }]);
   };
@@ -92,11 +116,12 @@ export default function TreasuryDashboard() {
         const response = await fetch('/api/transfer', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ action: 'mint_from_stellar_burn', toChain: to, burnTxHash: burnHash })
+          body: JSON.stringify({ action: 'mint_from_stellar_burn', toChain: to, amount: parsedAmount, burnTxHash: burnHash })
         });
         const data = await response.json();
         if (data.error) throw new Error(data.error);
         log(`Transfer Complete! Mint Hash: ${data.mintHash}`, 'success');
+        fetchHistory();
 
       } else if (to === "stellar") {
         if (!pollar.wallet?.address) throw new Error("Please connect Pollar wallet first");
@@ -122,6 +147,15 @@ export default function TreasuryDashboard() {
         });
         log(`Transfer Complete! Mint Hash: ${mintHash}`, 'success');
 
+        // Only case where the final hash is known client-side only - report
+        // it to the server so it lands in the persisted history too.
+        await fetch('/api/history', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ fromChain: from, toChain: to, amount: parsedAmount, burnHash: data.burnHash, mintHash, mode: 'manual' })
+        });
+        fetchHistory();
+
       } else {
         log(`Initiating Automated Backend Transfer from ${from} to ${to}...`);
         const response = await fetch('/api/transfer', {
@@ -132,6 +166,7 @@ export default function TreasuryDashboard() {
         const data = await response.json();
         if (data.error) throw new Error(data.error);
         log(`Transfer Complete! Burn Hash: ${data.burnHash}, Mint Hash: ${data.mintHash}`, 'success');
+        fetchHistory();
       }
     } catch (e: any) {
       log(`Error: ${e.message}`, 'error');
@@ -390,6 +425,49 @@ export default function TreasuryDashboard() {
                 )}
               </div>
             </div>
+          </div>
+        </div>
+
+        {/* Movement History */}
+        <div className="mt-6 bg-white border border-gray-200 rounded-2xl p-6 shadow-sm">
+          <h3 className="text-lg font-semibold text-gray-900 mb-6">Movement History</h3>
+
+          <div className="overflow-x-auto">
+            <table className="w-full text-sm text-left">
+              <thead>
+                <tr className="text-xs text-gray-500 border-b border-gray-100">
+                  <th className="pb-3 pr-4 font-medium">Time</th>
+                  <th className="pb-3 pr-4 font-medium">Route</th>
+                  <th className="pb-3 pr-4 font-medium">Amount</th>
+                  <th className="pb-3 pr-4 font-medium">Burn tx</th>
+                  <th className="pb-3 pr-4 font-medium">Mint tx</th>
+                  <th className="pb-3 font-medium">Mode</th>
+                </tr>
+              </thead>
+              <tbody>
+                {history.map((movement) => (
+                  <tr key={movement.id} className="border-b border-gray-50 last:border-0">
+                    <td className="py-3 pr-4 text-gray-500 whitespace-nowrap">{new Date(movement.timestamp).toLocaleString()}</td>
+                    <td className="py-3 pr-4 text-gray-900 font-medium capitalize whitespace-nowrap">{movement.fromChain} → {movement.toChain}</td>
+                    <td className="py-3 pr-4 text-gray-900 whitespace-nowrap">{movement.amount} USDC</td>
+                    <td className="py-3 pr-4">
+                      <a href={explorerUrl(movement.fromChain, movement.burnHash)} target="_blank" rel="noreferrer" className="text-pollar-blue hover:underline font-mono text-xs">
+                        {movement.burnHash.slice(0, 8)}...
+                      </a>
+                    </td>
+                    <td className="py-3 pr-4">
+                      <a href={explorerUrl(movement.toChain, movement.mintHash)} target="_blank" rel="noreferrer" className="text-pollar-blue hover:underline font-mono text-xs">
+                        {movement.mintHash.slice(0, 8)}...
+                      </a>
+                    </td>
+                    <td className="py-3 capitalize text-gray-500">{movement.mode}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+            {history.length === 0 && (
+              <div className="text-center text-gray-400 py-10">No movements recorded yet.</div>
+            )}
           </div>
         </div>
       </div>

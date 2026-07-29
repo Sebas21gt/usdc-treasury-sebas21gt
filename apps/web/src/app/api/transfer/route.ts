@@ -7,6 +7,8 @@ import {
   executeBurn,
   executeMint,
 } from '@usdc-treasury/engine';
+// Server-only: uses Node's fs/path, kept out of the client-safe barrel above.
+import { recordMovement } from '@usdc-treasury/engine/src/core/history';
 
 export async function POST(req: Request) {
   try {
@@ -22,7 +24,8 @@ export async function POST(req: Request) {
     // Fully server-side leg: neither side is Stellar, so no Pollar signer is needed.
     if (action === 'transfer') {
       const result = await transferUsdc({ fromChain, toChain, amount, destinationAddress });
-      return NextResponse.json({ success: true, ...result });
+      const record = recordMovement({ fromChain, toChain, amount, burnHash: result.burnHash, mintHash: result.mintHash, mode: 'manual' });
+      return NextResponse.json({ success: true, ...result, historyId: record.id });
     }
 
     // Source is Polygon/Solana, destination is Stellar: the server can burn
@@ -52,7 +55,8 @@ export async function POST(req: Request) {
         messageHex: message,
         attestationHex: attestation,
       });
-      return NextResponse.json({ success: true, mintHash });
+      const record = recordMovement({ fromChain: 'stellar', toChain, amount, burnHash: burnTxHash, mintHash, mode: 'manual' });
+      return NextResponse.json({ success: true, mintHash, historyId: record.id });
     }
 
     return NextResponse.json({ error: 'Invalid action' }, { status: 400 });
