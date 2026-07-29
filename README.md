@@ -14,7 +14,9 @@ npm install
 
 ### Environment variables
 
-Copy `.env.example` to `.env` (repo root) and fill in:
+Copy `.env.example` to `.env` **at the repo root** and fill in — it's the only env file in the repo. `apps/web`'s `dev` script loads it explicitly via [`dotenv-cli`](https://github.com/entropitor/dotenv-cli) (`dotenv -e ../../.env -- next dev`), since Next.js only auto-loads env files from its own app directory by default.
+
+This only matters for local development. In production (e.g. Vercel), there is no `.env` file at all — it's gitignored and never reaches the deployment. Set the same variables directly in your hosting provider's environment variable settings (Vercel: Project → Settings → Environment Variables, or `vercel env add`); they get injected into `process.env` at build/runtime with no file involved. `build` and `start` are plain `next build`/`next start` on purpose, so they behave identically locally and in prod.
 
 | Variable | Used for |
 |---|---|
@@ -22,6 +24,7 @@ Copy `.env.example` to `.env` (repo root) and fill in:
 | `POLYGON_PRIVATE_KEY` | Treasury's Polygon EVM key (burns/mints via viem). **Server-only** — never prefix this with `NEXT_PUBLIC_`. |
 | `SOLANA_RPC_URL` | Solana devnet RPC endpoint |
 | `SOLANA_PRIVATE_KEY` | Treasury's Solana keypair, base58-encoded (burns/mints via `@solana/web3.js`). Server-only. |
+| `TREASURY_STELLAR_ADDRESS` | Public G-address of the Pollar treasury wallet. Not a secret; needed by headless processes (e.g. `scripts/monitor.ts`) that have no browser session to ask. |
 | `NEXT_PUBLIC_POLLAR_API_KEY` | Pollar publishable key (`pub_testnet_...`) — this one *is* meant to be public, it identifies your Pollar app in the browser. |
 
 Polygon and Solana keys are plain hot wallets (testnet only, per the assignment's scope). The Stellar treasury wallet is different: it's a **Pollar custodial wallet**, connected from the browser (`pollar.openLoginModal()`), and every Stellar transaction is signed with `pollar.signAndSubmitTx(xdr)` — the engine never holds a Stellar private key.
@@ -61,6 +64,14 @@ npm run dev
 ```
 
 Open `http://localhost:3000`, connect the Pollar wallet, and use the "Manual Rebalance" form to trigger a one-off move (source, destination, amount) between any two of the three networks.
+
+## Running the inventory monitor
+
+```bash
+npm run monitor
+```
+
+Standalone engine process ([`scripts/monitor.ts`](./scripts/monitor.ts)) that reads all three networks' balances every 30s and reports each one's status against its configured min/target/max range. This is separate from the frontend's own balance polling (which is only for the dashboard's display) — it's the read side that automatic mode's rebalance logic will consume.
 
 Automatic mode (threshold-triggered rebalancing loop) and the persisted movement history are still in progress.
 
