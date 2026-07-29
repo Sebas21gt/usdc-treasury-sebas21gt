@@ -3,6 +3,7 @@ import { getTreasuryBalances } from '@usdc-treasury/engine';
 import { privateKeyToAccount } from 'viem/accounts';
 import { Keypair } from '@solana/web3.js';
 import bs58 from 'bs58';
+import { safeErrorMessage } from '@/lib/api';
 
 export const dynamic = 'force-dynamic';
 
@@ -41,6 +42,6 @@ export async function GET() {
     });
   } catch (error: any) {
     console.error("Inventory API Error:", error);
-    return NextResponse.json({ error: error.message }, { status: 500 });
+    return NextResponse.json({ error: safeErrorMessage(error) }, { status: 500 });
   }
 }

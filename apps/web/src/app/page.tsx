@@ -13,6 +13,26 @@ import {
 // Type-only: core/history uses Node's fs/path server-side, but `import type`
 // is fully erased at compile time, so it never gets bundled for the browser.
 import type { MovementRecord } from "@usdc-treasury/engine/src/core/history";
+import { parseAmount } from "@/lib/api";
+import { InventoryCard } from "@/components/InventoryCard";
+
+function PolygonIcon() {
+  return (
+    <svg className="w-5 h-5" fill="currentColor" viewBox="0 0 24 24"><path d="M12 0L22.5 6V18L12 24L1.5 18V6L12 0ZM12 4.5L5.5 8.25V15.75L12 19.5L18.5 15.75V8.25L12 4.5Z"/></svg>
+  );
+}
+
+function SolanaIcon() {
+  return (
+    <svg className="w-5 h-5" fill="currentColor" viewBox="0 0 24 24"><path d="M19.92 8.76L17.26 4.15H4.1L6.76 8.76H19.92ZM19.92 19.85L17.26 15.24H4.1L6.76 19.85H19.92ZM4.08 14.3H17.24L19.9 9.69H6.74L4.08 14.3Z"/></svg>
+  );
+}
+
+function StellarIcon() {
+  return (
+    <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M12 2L2 7l10 5 10-5-10-5zM2 17l10 5 10-5M2 12l10 5 10-5"></path></svg>
+  );
+}
 
 // Adapts Pollar's signAndSubmitTx to the engine's StellarXdrSigner shape.
 function makeStellarSigner(pollar: ReturnType<typeof usePollar>) {
@@ -105,87 +125,102 @@ export default function TreasuryDashboard() {
     setLogs((prev) => [...prev, { message, type }]);
   };
 
+  // Source is Stellar: burn signed via Pollar, then the backend polls the
+  // attestation and mints on the Polygon/Solana destination.
+  const runStellarSourceTransfer = async (to: SupportedChain, parsedAmount: number, destinationAddress: string) => {
+    if (!pollar.wallet?.address) throw new Error("Please connect Pollar wallet first");
+
+    log(`Initiating Manual Transfer from Stellar to ${to}...`);
+    log("1. Approve + Burn via Pollar...");
+    const { hash: burnHash } = await executeBurn({
+      fromChain: "stellar",
+      toChain: to,
+      amount: parsedAmount,
+      destinationAddress,
+      stellarWalletAddress: pollar.wallet.address,
+      signStellarXdr: makeStellarSigner(pollar),
+    });
+    log(`Burn success: ${burnHash}`, 'success');
+
+    log("2. Passing to backend to poll attestation and mint...");
+    const response = await fetch('/api/transfer', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ action: 'mint_from_stellar_burn', toChain: to, amount: parsedAmount, burnTxHash: burnHash })
+    });
+    const data = await response.json();
+    if (data.error) throw new Error(data.error);
+    log(`Transfer Complete! Mint Hash: ${data.mintHash}`, 'success');
+    fetchHistory();
+  };
+
+  // Destination is Stellar: the backend burns and waits for the attestation,
+  // then the mint into Stellar (via CctpForwarder) is signed via Pollar here.
+  const runStellarDestinationTransfer = async (from: SupportedChain, parsedAmount: number, destinationAddress: string) => {
+    if (!pollar.wallet?.address) throw new Error("Please connect Pollar wallet first");
+
+    log(`Initiating Transfer from ${from} to Stellar...`);
+    log("1. Burning on the backend...");
+    const response = await fetch('/api/transfer', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ action: 'burn_and_wait', fromChain: from, toChain: "stellar", amount: parsedAmount, destinationAddress })
+    });
+    const data = await response.json();
+    if (data.error) throw new Error(data.error);
+    log(`Burn success: ${data.burnHash}`, 'success');
+
+    log("2. Minting into Stellar via Pollar (CctpForwarder)...");
+    const { hash: mintHash } = await executeMint({
+      toChain: "stellar",
+      messageHex: data.messageHex,
+      attestationHex: data.attestationHex,
+      stellarWalletAddress: pollar.wallet.address,
+      signStellarXdr: makeStellarSigner(pollar),
+    });
+    log(`Transfer Complete! Mint Hash: ${mintHash}`, 'success');
+
+    // Only case where the final hash is known client-side only - report
+    // it to the server so it lands in the persisted history too.
+    await fetch('/api/history', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ fromChain: from, toChain: "stellar", amount: parsedAmount, burnHash: data.burnHash, mintHash, mode: 'manual' })
+    });
+    fetchHistory();
+  };
+
+  // Neither side is Stellar: fully server-side, no Pollar signer needed.
+  const runServerSideTransfer = async (from: SupportedChain, to: SupportedChain, parsedAmount: number, destinationAddress: string) => {
+    log(`Initiating Automated Backend Transfer from ${from} to ${to}...`);
+    const response = await fetch('/api/transfer', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ action: 'transfer', fromChain: from, toChain: to, amount: parsedAmount, destinationAddress })
+    });
+    const data = await response.json();
+    if (data.error) throw new Error(data.error);
+    log(`Transfer Complete! Burn Hash: ${data.burnHash}, Mint Hash: ${data.mintHash}`, 'success');
+    fetchHistory();
+  };
+
   const handleManualTransfer = async () => {
     setIsProcessing(true);
     setLogs([]);
     try {
       const from = fromChain as SupportedChain;
       const to = toChain as SupportedChain;
-      const parsedAmount = parseFloat(amount);
+      const parsedAmount = parseAmount(amount);
 
       const destinationAddress = to === 'polygon' ? addresses.polygon : to === 'solana' ? addresses.solana : addresses.stellar;
       if (!destinationAddress) throw new Error("Destination address not loaded yet. Please wait for inventory to sync.");
 
       if (from === "stellar") {
-        if (!pollar.wallet?.address) throw new Error("Please connect Pollar wallet first");
-
-        log(`Initiating Manual Transfer from Stellar to ${to}...`);
-        log("1. Approve + Burn via Pollar...");
-        const { hash: burnHash } = await executeBurn({
-          fromChain: from,
-          toChain: to,
-          amount: parsedAmount,
-          destinationAddress,
-          stellarWalletAddress: pollar.wallet.address,
-          signStellarXdr: makeStellarSigner(pollar),
-        });
-        log(`Burn success: ${burnHash}`, 'success');
-
-        log("2. Passing to backend to poll attestation and mint...");
-        const response = await fetch('/api/transfer', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ action: 'mint_from_stellar_burn', toChain: to, amount: parsedAmount, burnTxHash: burnHash })
-        });
-        const data = await response.json();
-        if (data.error) throw new Error(data.error);
-        log(`Transfer Complete! Mint Hash: ${data.mintHash}`, 'success');
-        fetchHistory();
-
+        await runStellarSourceTransfer(to, parsedAmount, destinationAddress);
       } else if (to === "stellar") {
-        if (!pollar.wallet?.address) throw new Error("Please connect Pollar wallet first");
-
-        log(`Initiating Transfer from ${from} to Stellar...`);
-        log("1. Burning on the backend...");
-        const response = await fetch('/api/transfer', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ action: 'burn_and_wait', fromChain: from, toChain: to, amount: parsedAmount, destinationAddress })
-        });
-        const data = await response.json();
-        if (data.error) throw new Error(data.error);
-        log(`Burn success: ${data.burnHash}`, 'success');
-
-        log("2. Minting into Stellar via Pollar (CctpForwarder)...");
-        const { hash: mintHash } = await executeMint({
-          toChain: to,
-          messageHex: data.messageHex,
-          attestationHex: data.attestationHex,
-          stellarWalletAddress: pollar.wallet.address,
-          signStellarXdr: makeStellarSigner(pollar),
-        });
-        log(`Transfer Complete! Mint Hash: ${mintHash}`, 'success');
-
-        // Only case where the final hash is known client-side only - report
-        // it to the server so it lands in the persisted history too.
-        await fetch('/api/history', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ fromChain: from, toChain: to, amount: parsedAmount, burnHash: data.burnHash, mintHash, mode: 'manual' })
-        });
-        fetchHistory();
-
+        await runStellarDestinationTransfer(from, parsedAmount, destinationAddress);
       } else {
-        log(`Initiating Automated Backend Transfer from ${from} to ${to}...`);
-        const response = await fetch('/api/transfer', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ action: 'transfer', fromChain: from, toChain: to, amount: parsedAmount, destinationAddress })
-        });
-        const data = await response.json();
-        if (data.error) throw new Error(data.error);
-        log(`Transfer Complete! Burn Hash: ${data.burnHash}, Mint Hash: ${data.mintHash}`, 'success');
-        fetchHistory();
+        await runServerSideTransfer(from, to, parsedAmount, destinationAddress);
       }
     } catch (e: any) {
       log(`Error: ${e.message}`, 'error');
@@ -205,7 +240,7 @@ export default function TreasuryDashboard() {
       if (!addresses.stellar) throw new Error("Treasury address not loaded yet. Please wait for inventory to sync.");
       if (!sendDestinationAddress) throw new Error("Enter a destination address for P2");
 
-      const parsedAmount = parseFloat(sendAmount);
+      const parsedAmount = parseAmount(sendAmount);
 
       log(`P1 paying ${parsedAmount} USDC into the treasury on Stellar...`);
       const { hash: depositHash } = await payIntoTreasuryFromStellar({
@@ -283,110 +318,54 @@ export default function TreasuryDashboard() {
 
         {/* Inventory Cards */}
         <div className="grid grid-cols-1 md:grid-cols-3 gap-6 mb-10">
-          
-          {/* Polygon Card */}
-          <div className="bg-white rounded-2xl p-6 border border-gray-200 shadow-sm hover:shadow-md transition-shadow">
-            <div className="flex justify-between items-start mb-6">
-              <div className="flex items-center gap-3">
-                <div className="w-10 h-10 rounded-full bg-purple-50 flex items-center justify-center">
-                  <svg className="w-5 h-5 text-purple-600" fill="currentColor" viewBox="0 0 24 24"><path d="M12 0L22.5 6V18L12 24L1.5 18V6L12 0ZM12 4.5L5.5 8.25V15.75L12 19.5L18.5 15.75V8.25L12 4.5Z"/></svg>
-                </div>
-                <div>
-                  <h3 className="font-semibold text-gray-900">Polygon</h3>
-                  <p className="text-xs text-gray-500">Amoy Testnet</p>
-                </div>
-              </div>
-              <span className="px-2.5 py-1 bg-purple-50 text-purple-700 text-xs font-semibold rounded-full border border-purple-100">
-                EVM
-              </span>
-            </div>
-            
-            <div className="mb-4">
-              <span className="text-3xl font-bold text-gray-900 tracking-tight">{isBalancesLoading ? '--' : balances.polygon.toLocaleString()}</span>
-              <span className="text-gray-500 font-medium ml-2">USDC</span>
-            </div>
-            
-            <div className="space-y-2">
-              <div className="flex justify-between text-xs font-medium text-gray-500">
-                <span>Min: {TREASURY_CONFIG.polygon.min}</span>
-                <span className="text-gray-900">Target: {TREASURY_CONFIG.polygon.target}</span>
-                <span>Max: {TREASURY_CONFIG.polygon.max}</span>
-              </div>
-              <div className="w-full bg-gray-100 rounded-full h-1.5 overflow-hidden">
-                <div className="bg-pollar-blue h-full rounded-full transition-all duration-500" style={{ width: `${Math.min((balances.polygon / TREASURY_CONFIG.polygon.max) * 100, 100)}%` }}></div>
-              </div>
-            </div>
-          </div>
+          <InventoryCard
+            name="Polygon"
+            subtitle="Amoy Testnet"
+            badgeLabel="EVM"
+            icon={<PolygonIcon />}
+            balance={balances.polygon}
+            isLoading={isBalancesLoading}
+            min={TREASURY_CONFIG.polygon.min}
+            target={TREASURY_CONFIG.polygon.target}
+            max={TREASURY_CONFIG.polygon.max}
+            accentIconBg="bg-purple-50"
+            accentIconColor="text-purple-600"
+            accentBadgeBg="bg-purple-50"
+            accentBadgeText="text-purple-700"
+            accentBadgeBorder="border-purple-100"
+            accentBar="bg-pollar-blue"
+          />
 
-          {/* Solana Card */}
-          <div className="bg-white rounded-2xl p-6 border border-gray-200 shadow-sm hover:shadow-md transition-shadow">
-            <div className="flex justify-between items-start mb-6">
-              <div className="flex items-center gap-3">
-                <div className="w-10 h-10 rounded-full bg-green-50 flex items-center justify-center">
-                  <svg className="w-5 h-5 text-green-500" fill="currentColor" viewBox="0 0 24 24"><path d="M19.92 8.76L17.26 4.15H4.1L6.76 8.76H19.92ZM19.92 19.85L17.26 15.24H4.1L6.76 19.85H19.92ZM4.08 14.3H17.24L19.9 9.69H6.74L4.08 14.3Z"/></svg>
-                </div>
-                <div>
-                  <h3 className="font-semibold text-gray-900">Solana</h3>
-                  <p className="text-xs text-gray-500">Devnet</p>
-                </div>
-              </div>
-              <span className="px-2.5 py-1 bg-green-50 text-green-700 text-xs font-semibold rounded-full border border-green-100">
-                SVM
-              </span>
-            </div>
-            
-            <div className="mb-4">
-              <span className="text-3xl font-bold text-gray-900 tracking-tight">{isBalancesLoading ? '--' : balances.solana.toLocaleString()}</span>
-              <span className="text-gray-500 font-medium ml-2">USDC</span>
-            </div>
-            
-            <div className="space-y-2">
-              <div className="flex justify-between text-xs font-medium text-gray-500">
-                <span>Min: {TREASURY_CONFIG.solana.min}</span>
-                <span className="text-gray-900">Target: {TREASURY_CONFIG.solana.target}</span>
-                <span>Max: {TREASURY_CONFIG.solana.max}</span>
-              </div>
-              <div className="w-full bg-gray-100 rounded-full h-1.5 overflow-hidden">
-                <div className="bg-yellow-400 h-full rounded-full transition-all duration-500" style={{ width: `${Math.min((balances.solana / TREASURY_CONFIG.solana.max) * 100, 100)}%` }}></div>
-              </div>
-            </div>
-          </div>
+          <InventoryCard
+            name="Solana"
+            subtitle="Devnet"
+            badgeLabel="SVM"
+            icon={<SolanaIcon />}
+            balance={balances.solana}
+            isLoading={isBalancesLoading}
+            min={TREASURY_CONFIG.solana.min}
+            target={TREASURY_CONFIG.solana.target}
+            max={TREASURY_CONFIG.solana.max}
+            accentIconBg="bg-green-50"
+            accentIconColor="text-green-500"
+            accentBadgeBg="bg-green-50"
+            accentBadgeText="text-green-700"
+            accentBadgeBorder="border-green-100"
+            accentBar="bg-yellow-400"
+          />
 
-          {/* Stellar Card - Highlighted/Active State from Design */}
-          <div className="bg-pollar-blue rounded-2xl p-6 shadow-md shadow-pollar-blue-dark/20 text-white relative overflow-hidden">
-            <div className="absolute top-0 right-0 w-32 h-32 bg-white/10 rounded-full -mr-10 -mt-10 blur-2xl"></div>
-            
-            <div className="flex justify-between items-start mb-6 relative z-10">
-              <div className="flex items-center gap-3">
-                <div className="w-10 h-10 rounded-full bg-white/20 flex items-center justify-center backdrop-blur-sm">
-                  <svg className="w-5 h-5 text-white" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M12 2L2 7l10 5 10-5-10-5zM2 17l10 5 10-5M2 12l10 5 10-5"></path></svg>
-                </div>
-                <div>
-                  <h3 className="font-semibold text-white">Stellar</h3>
-                  <p className="text-xs text-blue-100">Testnet</p>
-                </div>
-              </div>
-              <span className="px-2.5 py-1 bg-white/20 text-white text-xs font-semibold rounded-full backdrop-blur-sm">
-                Soroban
-              </span>
-            </div>
-            
-            <div className="mb-4 relative z-10">
-              <span className="text-3xl font-bold tracking-tight">{isBalancesLoading ? '--' : balances.stellar.toLocaleString()}</span>
-              <span className="text-blue-100 font-medium ml-2">USDC</span>
-            </div>
-            
-            <div className="space-y-2 relative z-10">
-              <div className="flex justify-between text-xs font-medium text-blue-100">
-                <span>Min: {TREASURY_CONFIG.stellar.min}</span>
-                <span className="text-white">Target: {TREASURY_CONFIG.stellar.target}</span>
-                <span>Max: {TREASURY_CONFIG.stellar.max}</span>
-              </div>
-              <div className="w-full bg-black/20 rounded-full h-1.5 overflow-hidden">
-                <div className="bg-white h-full rounded-full transition-all duration-500" style={{ width: `${Math.min((balances.stellar / TREASURY_CONFIG.stellar.max) * 100, 100)}%` }}></div>
-              </div>
-            </div>
-          </div>
+          <InventoryCard
+            name="Stellar"
+            subtitle="Testnet"
+            badgeLabel="Soroban"
+            icon={<StellarIcon />}
+            balance={balances.stellar}
+            isLoading={isBalancesLoading}
+            min={TREASURY_CONFIG.stellar.min}
+            target={TREASURY_CONFIG.stellar.target}
+            max={TREASURY_CONFIG.stellar.max}
+            highlighted
+          />
         </div>
 
         {/* Movement History */}
