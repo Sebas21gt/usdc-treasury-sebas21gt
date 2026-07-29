@@ -1,81 +1,110 @@
 import 'dotenv/config';
-import { polygonBurn, getPolygonBalance, polygonExplorerUrl } from '../packages/engine/src/chains/polygon';
-import { solanaMint, getSolanaBalance, solanaExplorerUrl }    from '../packages/engine/src/chains/solana';
-import { pollAttestation }                                    from '../packages/engine/src/cctp/attestation';
+import { Keypair, PublicKey } from '@solana/web3.js';
+import { getAssociatedTokenAddress } from '@solana/spl-token';
+import { privateKeyToAccount } from 'viem/accounts';
+import bs58 from 'bs58';
+import {
+  CCTP_CONTRACTS,
+  burnOnPolygon,
+  mintOnSolana,
+  waitForAttestation,
+  getPolygonBalance,
+  getSolanaBalance,
+} from '../packages/engine/src/index';
 
-const AMOUNT_USDC = 1; 
+const AMOUNT_USDC = 1;
+
+function polygonExplorerUrl(hash: string) {
+  return `https://amoy.polygonscan.com/tx/${hash}`;
+}
+
+function solanaExplorerUrl(hash: string) {
+  return `https://explorer.solana.com/tx/${hash}?cluster=devnet`;
+}
 
 async function main() {
-  console.log('Starting Spike 1: Polygon Amoy -> Solana Devnet (CCTP v2)');
-  console.log('---------------------------------------------------------');
+  console.log('Spike: Polygon Amoy -> Solana devnet (CCTP v2, Standard transfer)');
+  console.log('-------------------------------------------------------------------');
 
-  const polygonRpc = process.env.POLYGON_RPC_URL!;
-  const solanaRpc  = process.env.SOLANA_RPC_URL!;
+  const polygonPrivateKey = process.env.POLYGON_PRIVATE_KEY;
+  const polygonRpcUrl = process.env.POLYGON_RPC_URL;
+  const solanaPrivateKeyBase58 = process.env.SOLANA_PRIVATE_KEY;
+  const solanaRpcUrl = process.env.SOLANA_RPC_URL;
 
-  console.log('Reading initial balances...');
+  if (!polygonPrivateKey) throw new Error('Missing POLYGON_PRIVATE_KEY in env');
+  if (!solanaPrivateKeyBase58) throw new Error('Missing SOLANA_PRIVATE_KEY in env');
+
+  const polygonAccount = privateKeyToAccount(
+    polygonPrivateKey.startsWith('0x') ? (polygonPrivateKey as `0x${string}`) : `0x${polygonPrivateKey}`
+  );
+  const solanaKeypair = Keypair.fromSecretKey(bs58.decode(solanaPrivateKeyBase58));
+
+  console.log(`Polygon account: ${polygonAccount.address}`);
+  console.log(`Solana account:  ${solanaKeypair.publicKey.toBase58()}`);
+
+  console.log('\nReading initial balances...');
   const [polygonBefore, solanaBefore] = await Promise.all([
-    getPolygonBalance(polygonRpc),
-    getSolanaBalance(solanaRpc),
+    getPolygonBalance(polygonAccount.address, polygonRpcUrl),
+    getSolanaBalance(solanaKeypair.publicKey.toBase58(), solanaRpcUrl),
   ]);
   console.log(`Polygon Amoy: ${polygonBefore} USDC`);
   console.log(`Solana devnet: ${solanaBefore} USDC`);
 
-  console.log(`\nStep 1: Burning ${AMOUNT_USDC} USDC on Polygon Amoy...`);
-  
-  const { Keypair } = await import('@solana/web3.js');
-  const bs58 = (await import('bs58')).default;
-  let solanaKeypair: typeof Keypair.prototype;
-  try {
-    solanaKeypair = Keypair.fromSecretKey(Uint8Array.from(JSON.parse(process.env.SOLANA_PRIVATE_KEY!)));
-  } catch {
-    solanaKeypair = Keypair.fromSecretKey(bs58.decode(process.env.SOLANA_PRIVATE_KEY!));
-  }
-  const { getAssociatedTokenAddressSync } = await import('@solana/spl-token');
-  const { PublicKey } = await import('@solana/web3.js');
-  const { CCTP_CONTRACTS } = await import('../packages/engine/src/config');
   const usdcMint = new PublicKey(CCTP_CONTRACTS.solana.usdc);
-  const userAta = getAssociatedTokenAddressSync(usdcMint, solanaKeypair.publicKey);
-  const mintRecipient = `0x${Buffer.from(userAta.toBytes()).toString('hex')}`;
+  const solanaAta = await getAssociatedTokenAddress(usdcMint, solanaKeypair.publicKey);
+  const mintRecipientBytes32 = `0x${Buffer.from(solanaAta.toBytes()).toString('hex')}`;
+  const amountSubunits = BigInt(AMOUNT_USDC * 1_000_000); // 6 decimals
 
-  const burnResult = await polygonBurn({
-    rpcUrl:            polygonRpc,
-    destinationDomain: 5, 
-    amountUsdc:        AMOUNT_USDC,
-    mintRecipient:     mintRecipient as `0x${string}`,
+  console.log(`\nStep 1: burning ${AMOUNT_USDC} USDC on Polygon Amoy (depositForBurn, Standard finality)...`);
+  const burnResult = await burnOnPolygon({
+    amountSubunits,
+    destinationDomain: CCTP_CONTRACTS.solana.domain,
+    mintRecipientBytes32,
+    privateKeyHex: polygonPrivateKey,
+    rpcUrl: polygonRpcUrl,
   });
+  console.log(`Burn tx: ${burnResult.hash}`);
+  console.log(`Polygon Explorer: ${polygonExplorerUrl(burnResult.hash)}`);
 
-  console.log(`Burn transaction sent: ${burnResult.txHash}`);
-  console.log(`Polygon Explorer: ${polygonExplorerUrl(burnResult.txHash)}`);
+  console.log('\nStep 2: waiting for Circle attestation (Iris API v2)...');
+  const { message, attestation } = await waitForAttestation(CCTP_CONTRACTS.polygon.domain, burnResult.hash);
+  console.log('Attestation received.');
 
-  console.log('\nStep 2: Waiting for Circle attestation (Iris API)...');
-  const attestation = await pollAttestation({
-    sourceDomain: 7,
-    burnTxHash:   burnResult.txHash,
+  console.log('\nStep 3: minting USDC on Solana devnet (receiveMessage)...');
+  const mintResult = await mintOnSolana({
+    messageHex: message,
+    attestationHex: attestation,
+    privateKeyBase58: solanaPrivateKeyBase58,
+    rpcUrl: solanaRpcUrl,
   });
-  console.log(`Attestation received.`);
-
-  console.log('\nStep 3: Minting USDC on Solana devnet...');
-  const mintResult = await solanaMint({
-    rpcUrl:            solanaRpc,
-    attestation,
-    sourceChainDomain: 7,
-  });
-
-  console.log(`Mint transaction sent: ${mintResult.txHash}`);
-  console.log(`Solana Explorer: ${solanaExplorerUrl(mintResult.txHash)}`);
+  console.log(`Mint tx: ${mintResult.hash}`);
+  console.log(`Solana Explorer: ${solanaExplorerUrl(mintResult.hash)}`);
 
   console.log('\nReading final balances...');
   const [polygonAfter, solanaAfter] = await Promise.all([
-    getPolygonBalance(polygonRpc),
-    getSolanaBalance(solanaRpc),
+    getPolygonBalance(polygonAccount.address, polygonRpcUrl),
+    getSolanaBalance(solanaKeypair.publicKey.toBase58(), solanaRpcUrl),
   ]);
 
-  console.log('\nSPIKE 1 COMPLETED SUCCESSFULLY');
+  console.log('\nSPIKE COMPLETED SUCCESSFULLY');
   console.log(`Polygon balance: ${polygonBefore} -> ${polygonAfter} USDC`);
   console.log(`Solana balance:  ${solanaBefore} -> ${solanaAfter} USDC`);
+  console.log('\nResult (for README):');
+  console.log(
+    JSON.stringify(
+      {
+        burnTxHash: burnResult.hash,
+        burnExplorer: polygonExplorerUrl(burnResult.hash),
+        mintTxHash: mintResult.hash,
+        mintExplorer: solanaExplorerUrl(mintResult.hash),
+      },
+      null,
+      2
+    )
+  );
 }
 
-main().catch(err => {
-  console.error('\nSPIKE 1 FAILED:', err);
+main().catch((err) => {
+  console.error('\nSPIKE FAILED:', err);
   process.exit(1);
 });

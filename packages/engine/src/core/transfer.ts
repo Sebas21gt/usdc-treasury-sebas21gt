@@ -1,4 +1,5 @@
 import { IRIS_API_URL, SupportedChain, CCTP_CONTRACTS } from '../config';
+import bs58 from 'bs58';
 
 /**
  * Polls the Circle Iris API for an attestation.
@@ -12,8 +13,8 @@ export async function waitForAttestation(sourceDomain: number, txHash: string): 
   while (true) {
     const res = await fetch(url);
     if (res.ok) {
-      const data = await res.json();
-      const complete = data.messages?.find((m: any) => m.status === "complete");
+      const data = await res.json() as { messages?: { status: string; message: string; attestation: string }[] };
+      const complete = data.messages?.find((m) => m.status === "complete");
       if (complete) {
         return {
           message: complete.message,

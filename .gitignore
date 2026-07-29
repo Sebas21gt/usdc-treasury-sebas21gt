@@ -7,3 +7,8 @@ dist/
 .DS_Store
 *.db
 *.db-journal
+
+# ad-hoc root-level debug/probe scripts, not part of the deliverable
+/check.js
+/check_*.js
+/test_amoy*.js

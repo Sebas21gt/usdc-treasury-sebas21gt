@@ -1,8 +1,25 @@
 "use client";
 
 import { usePollar } from "@pollar/react";
-import { useState } from "react";
-import { CCTP_CONTRACTS, buildFullStellarApproveTx, buildFullStellarBurnTx, buildFullStellarMintTx } from "@usdc-treasury/engine";
+import { useState, useEffect } from "react";
+import {
+  TREASURY_CONFIG,
+  executeBurn,
+  executeMint,
+  SupportedChain,
+  StellarSignResult,
+} from "@usdc-treasury/engine";
+
+// Adapts Pollar's signAndSubmitTx to the engine's StellarXdrSigner shape.
+function makeStellarSigner(pollar: ReturnType<typeof usePollar>) {
+  return async (unsignedXdr: string): Promise<StellarSignResult> => {
+    const result = await pollar.signAndSubmitTx(unsignedXdr);
+    if (result.status === "error") {
+      return { status: "error", details: result.details };
+    }
+    return { status: "success", hash: result.hash };
+  };
+}
 
 export default function TreasuryDashboard() {
   const pollar = usePollar();
@@ -13,6 +30,34 @@ export default function TreasuryDashboard() {
   const [toChain, setToChain] = useState<string>("solana");
   const [amount, setAmount] = useState<string>("1"); // In USDC
   
+  const [balances, setBalances] = useState({ polygon: 0, solana: 0, stellar: 0 });
+  const [addresses, setAddresses] = useState({ polygon: '', solana: '', stellar: '' });
+  const [isBalancesLoading, setIsBalancesLoading] = useState(true);
+
+  useEffect(() => {
+    let interval: any;
+    const fetchBalances = async () => {
+      try {
+        const url = `/api/inventory${pollar.wallet?.address ? `?stellarAddress=${pollar.wallet.address}` : ''}`;
+        const res = await fetch(url);
+        const data = await res.json();
+        if (data && !data.error) {
+          setBalances(data);
+          if (data.addresses) setAddresses(data.addresses);
+        }
+      } catch (e) {
+        console.error("Failed to fetch balances", e);
+      } finally {
+        setIsBalancesLoading(false);
+      }
+    };
+    
+    fetchBalances();
+    interval = setInterval(fetchBalances, 15000); // 15 seconds
+    
+    return () => clearInterval(interval);
+  }, [pollar.wallet?.address]);
+  
   const log = (message: string, type: 'info' | 'success' | 'error' = 'info') => {
     setLogs((prev) => [...prev, { message, type }]);
   };
@@ -21,97 +66,72 @@ export default function TreasuryDashboard() {
     setIsProcessing(true);
     setLogs([]);
     try {
-      // 6 decimals for EVM/Solana, 7 for Stellar. 
-      let amountSubunitsEVM = BigInt(parseFloat(amount) * 1_000_000);
-      let amountSubunitsStellar = BigInt(parseFloat(amount) * 10_000_000);
+      const from = fromChain as SupportedChain;
+      const to = toChain as SupportedChain;
+      const parsedAmount = parseFloat(amount);
 
-      const sourceDomain = CCTP_CONTRACTS[fromChain as keyof typeof CCTP_CONTRACTS]?.domain;
-      const destinationDomain = CCTP_CONTRACTS[toChain as keyof typeof CCTP_CONTRACTS]?.domain;
+      const destinationAddress = to === 'polygon' ? addresses.polygon : to === 'solana' ? addresses.solana : addresses.stellar;
+      if (!destinationAddress) throw new Error("Destination address not loaded yet. Please wait for inventory to sync.");
 
-      if (sourceDomain === undefined || destinationDomain === undefined) throw new Error("Invalid chains selected");
-
-      if (fromChain === "stellar") {
+      if (from === "stellar") {
         if (!pollar.wallet?.address) throw new Error("Please connect Pollar wallet first");
-        
-        log(`Initiating Manual Transfer from Stellar to ${toChain}...`);
-        log("1. Requesting Approve via Pollar...");
-        
-        const approveXdr = await buildFullStellarApproveTx({
-          amountSubunits: amountSubunitsStellar,
-          burnTokenStrkey: CCTP_CONTRACTS.stellar.usdc,
-          sourceAccountPubkey: pollar.wallet.address
+
+        log(`Initiating Manual Transfer from Stellar to ${to}...`);
+        log("1. Approve + Burn via Pollar...");
+        const { hash: burnHash } = await executeBurn({
+          fromChain: from,
+          toChain: to,
+          amount: parsedAmount,
+          destinationAddress,
+          stellarWalletAddress: pollar.wallet.address,
+          signStellarXdr: makeStellarSigner(pollar),
         });
-        
-        const approveResult = await pollar.signAndSubmitTx(approveXdr);
-        if (approveResult.status === "error") throw new Error(approveResult.details || "Approve failed");
-        log(`Approve success: ${approveResult.hash}`, 'success');
-        await new Promise(r => setTimeout(r, 2000));
+        log(`Burn success: ${burnHash}`, 'success');
 
-        log("2. Requesting Burn via Pollar...");
-        const recipientAddress = "0x0279A7D9f93805A9D0bF7bb7a88A99D7392934AC"; 
-        const mintRecipientBytes32 = recipientAddress.replace("0x", "").padStart(64, "0"); 
-
-        const unsignedXdr = await buildFullStellarBurnTx({
-          amountSubunits: amountSubunitsStellar,
-          destinationDomain,
-          mintRecipientBytes32,
-          burnTokenStrkey: CCTP_CONTRACTS.stellar.usdc,
-          sourceAccountPubkey: pollar.wallet.address
-        });
-
-        const burnResult = await pollar.signAndSubmitTx(unsignedXdr);
-        if (burnResult.status === "error") throw new Error(burnResult.details || "Burn failed");
-        log(`Burn success: ${burnResult.hash}`, 'success');
-
-        log("3. Passing to Backend to poll and mint...");
+        log("2. Passing to backend to poll attestation and mint...");
         const response = await fetch('/api/transfer', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            action: 'mint',
-            sourceDomain,
-            destinationDomain,
-            txHash: burnResult.hash,
-          })
+          body: JSON.stringify({ action: 'mint_from_stellar_burn', toChain: to, burnTxHash: burnHash })
         });
         const data = await response.json();
         if (data.error) throw new Error(data.error);
-        log(`Transfer Complete! Mint Hash: ${data.hash}`, 'success');
+        log(`Transfer Complete! Mint Hash: ${data.mintHash}`, 'success');
+
+      } else if (to === "stellar") {
+        if (!pollar.wallet?.address) throw new Error("Please connect Pollar wallet first");
+
+        log(`Initiating Transfer from ${from} to Stellar...`);
+        log("1. Burning on the backend...");
+        const response = await fetch('/api/transfer', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ action: 'burn_and_wait', fromChain: from, toChain: to, amount: parsedAmount, destinationAddress })
+        });
+        const data = await response.json();
+        if (data.error) throw new Error(data.error);
+        log(`Burn success: ${data.burnHash}`, 'success');
+
+        log("2. Minting into Stellar via Pollar (CctpForwarder)...");
+        const { hash: mintHash } = await executeMint({
+          toChain: to,
+          messageHex: data.messageHex,
+          attestationHex: data.attestationHex,
+          stellarWalletAddress: pollar.wallet.address,
+          signStellarXdr: makeStellarSigner(pollar),
+        });
+        log(`Transfer Complete! Mint Hash: ${mintHash}`, 'success');
 
       } else {
-        log(`Initiating Automated Backend Transfer from ${fromChain} to ${toChain}...`);
-        
-        const recipientAddress = "0x0279A7D9f93805A9D0bF7bb7a88A99D7392934AC";
-        const mintRecipientBytes32 = recipientAddress.replace("0x", "").padStart(64, "0"); 
-        
+        log(`Initiating Automated Backend Transfer from ${from} to ${to}...`);
         const response = await fetch('/api/transfer', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            action: 'full_transfer',
-            sourceDomain,
-            destinationDomain,
-            amount: amountSubunitsEVM.toString(),
-            mintRecipientBytes32
-          })
+          body: JSON.stringify({ action: 'transfer', fromChain: from, toChain: to, amount: parsedAmount, destinationAddress })
         });
         const data = await response.json();
         if (data.error) throw new Error(data.error);
-
-        if (data.needsClientMint) {
-          log(`Burn and poll complete on backend. Proceeding to Client-Side Mint on Stellar...`, 'success');
-          if (!pollar.wallet?.address) throw new Error("Please connect Pollar wallet first");
-          const unsignedXdr = await buildFullStellarMintTx({
-            messageHex: data.messageHex,
-            attestationHex: data.attestationHex,
-            sourceAccountPubkey: pollar.wallet.address
-          });
-          const mintResult = await pollar.signAndSubmitTx(unsignedXdr);
-          if (mintResult.status === "error") throw new Error(mintResult.details || "Mint failed");
-          log(`Stellar Mint Complete! Hash: ${mintResult.hash}`, 'success');
-        } else {
-          log(`Transfer Complete! Burn Hash: ${data.burnHash}, Mint Hash: ${data.mintHash}`, 'success');
-        }
+        log(`Transfer Complete! Burn Hash: ${data.burnHash}, Mint Hash: ${data.mintHash}`, 'success');
       }
     } catch (e: any) {
       log(`Error: ${e.message}`, 'error');
@@ -170,18 +190,18 @@ export default function TreasuryDashboard() {
             </div>
             
             <div className="mb-4">
-              <span className="text-3xl font-bold text-gray-900 tracking-tight">--</span>
+              <span className="text-3xl font-bold text-gray-900 tracking-tight">{isBalancesLoading ? '--' : balances.polygon.toLocaleString()}</span>
               <span className="text-gray-500 font-medium ml-2">USDC</span>
             </div>
             
             <div className="space-y-2">
               <div className="flex justify-between text-xs font-medium text-gray-500">
-                <span>Min: 10</span>
-                <span className="text-gray-900">Target: 50</span>
-                <span>Max: 100</span>
+                <span>Min: {TREASURY_CONFIG.polygon.min}</span>
+                <span className="text-gray-900">Target: {TREASURY_CONFIG.polygon.target}</span>
+                <span>Max: {TREASURY_CONFIG.polygon.max}</span>
               </div>
               <div className="w-full bg-gray-100 rounded-full h-1.5 overflow-hidden">
-                <div className="bg-pollar-blue h-full rounded-full transition-all duration-500" style={{ width: '45%' }}></div>
+                <div className="bg-pollar-blue h-full rounded-full transition-all duration-500" style={{ width: `${Math.min((balances.polygon / TREASURY_CONFIG.polygon.max) * 100, 100)}%` }}></div>
               </div>
             </div>
           </div>
@@ -204,18 +224,18 @@ export default function TreasuryDashboard() {
             </div>
             
             <div className="mb-4">
-              <span className="text-3xl font-bold text-gray-900 tracking-tight">--</span>
+              <span className="text-3xl font-bold text-gray-900 tracking-tight">{isBalancesLoading ? '--' : balances.solana.toLocaleString()}</span>
               <span className="text-gray-500 font-medium ml-2">USDC</span>
             </div>
             
             <div className="space-y-2">
               <div className="flex justify-between text-xs font-medium text-gray-500">
-                <span>Min: 10</span>
-                <span className="text-gray-900">Target: 50</span>
-                <span>Max: 100</span>
+                <span>Min: {TREASURY_CONFIG.solana.min}</span>
+                <span className="text-gray-900">Target: {TREASURY_CONFIG.solana.target}</span>
+                <span>Max: {TREASURY_CONFIG.solana.max}</span>
               </div>
               <div className="w-full bg-gray-100 rounded-full h-1.5 overflow-hidden">
-                <div className="bg-yellow-400 h-full rounded-full transition-all duration-500" style={{ width: '20%' }}></div>
+                <div className="bg-yellow-400 h-full rounded-full transition-all duration-500" style={{ width: `${Math.min((balances.solana / TREASURY_CONFIG.solana.max) * 100, 100)}%` }}></div>
               </div>
             </div>
           </div>
@@ -240,18 +260,18 @@ export default function TreasuryDashboard() {
             </div>
             
             <div className="mb-4 relative z-10">
-              <span className="text-3xl font-bold tracking-tight">--</span>
+              <span className="text-3xl font-bold tracking-tight">{isBalancesLoading ? '--' : balances.stellar.toLocaleString()}</span>
               <span className="text-blue-100 font-medium ml-2">USDC</span>
             </div>
             
             <div className="space-y-2 relative z-10">
               <div className="flex justify-between text-xs font-medium text-blue-100">
-                <span>Min: 10</span>
-                <span className="text-white">Target: 50</span>
-                <span>Max: 100</span>
+                <span>Min: {TREASURY_CONFIG.stellar.min}</span>
+                <span className="text-white">Target: {TREASURY_CONFIG.stellar.target}</span>
+                <span>Max: {TREASURY_CONFIG.stellar.max}</span>
               </div>
               <div className="w-full bg-black/20 rounded-full h-1.5 overflow-hidden">
-                <div className="bg-white h-full rounded-full transition-all duration-500" style={{ width: '85%' }}></div>
+                <div className="bg-white h-full rounded-full transition-all duration-500" style={{ width: `${Math.min((balances.stellar / TREASURY_CONFIG.stellar.max) * 100, 100)}%` }}></div>
               </div>
             </div>
           </div>
